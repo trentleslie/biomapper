@@ -14,6 +14,10 @@ SAMPLE_API_RESPONSE: dict[str, Any] = {
         "name": "L-Histidine",
         "curies": ["RM:0129894", "CHEBI:15971"],
         "chosen_kg_id": "CHEBI:15971",
+        "kg_equivalent_ids": {
+            "CHEBI": ["15971", "44637"],
+            "HMDB": ["HMDB0000177"],
+        },
         "kg_ids": {"CHEBI:15971": ["RM:0129894", "CHEBI:15971"]},
         "assigned_ids": {
             "metabolomics-workbench": {
@@ -58,6 +62,10 @@ SAMPLE_BATCH_ENTRY_RESOLVED: dict[str, Any] = {
     "name": "L-Histidine",
     "curies": ["RM:0129894", "CHEBI:15971"],
     "chosen_kg_id": "CHEBI:15971",
+    "kg_equivalent_ids": {
+        "CHEBI": ["15971", "44637"],
+        "HMDB": ["HMDB0000177"],
+    },
     "kg_ids": {"CHEBI:15971": ["RM:0129894", "CHEBI:15971"]},
     "assigned_ids": {
         "metabolomics-workbench": {"refmet_id": {"RM0129894": {}}},

@@ -38,6 +38,17 @@ class TestMappingResultFromApiResponse:
         assert result.ids_for("refmet_id") == ["RM0129894"]
         assert result.ids_for("HMDB") == []
 
+    def test_kg_equivalent_ids_surfaced(self, sample_api_response: dict[str, Any]) -> None:
+        result = MappingResult.from_api_response(sample_api_response, "L-Histidine")
+
+        assert result.kg_equivalent_ids == {
+            "CHEBI": ["15971", "44637"],
+            "HMDB": ["HMDB0000177"],
+        }
+        assert result.equivalent_ids_for("HMDB") == ["HMDB0000177"]
+        assert result.equivalent_ids_for("CHEBI") == ["15971", "44637"]
+        assert result.equivalent_ids_for("NONEXISTENT") == []
+
     def test_hmdb_hint_preserved(self, sample_api_response: dict[str, Any]) -> None:
         result = MappingResult.from_api_response(
             sample_api_response, "L-Histidine", hmdb_hint="HMDB00177"
@@ -52,6 +63,7 @@ class TestMappingResultFromApiResponse:
         assert result.confidence_score is None
         assert result.confidence_tier == "unknown"
         assert result.error is None
+        assert result.kg_equivalent_ids == {}
 
     def test_network_error_response(self) -> None:
         result = MappingResult.from_api_response(
@@ -75,6 +87,41 @@ class TestMappingResultFromApiResponse:
         assert make(1.0).confidence_tier == "medium"
         assert make(0.9).confidence_tier == "low"
         assert make(None).confidence_tier == "unknown"
+
+
+class TestRawApiResultEquivalentIds:
+    def test_parses_kg_equivalent_ids(self) -> None:
+        raw = RawApiResult.model_validate({
+            "name": "cholesterol",
+            "curies": ["CHEBI:16113"],
+            "chosen_kg_id": "CHEBI:16113",
+            "kg_equivalent_ids": {"CHEBI": ["16113", "172955"], "HMDB": ["HMDB0000067"]},
+            "kg_ids": {},
+            "assigned_ids": {},
+            "error": None,
+        })
+        assert raw.kg_equivalent_ids == {"CHEBI": ["16113", "172955"], "HMDB": ["HMDB0000067"]}
+
+    def test_missing_kg_equivalent_ids_defaults_empty(self) -> None:
+        raw = RawApiResult.model_validate({
+            "name": "x",
+            "curies": [],
+            "chosen_kg_id": None,
+            "kg_ids": {},
+            "assigned_ids": {},
+            "error": None,
+        })
+        assert raw.kg_equivalent_ids == {}
+
+    def test_empty_kg_equivalent_ids(self) -> None:
+        raw = RawApiResult.model_validate({
+            "name": "x",
+            "curies": [],
+            "kg_equivalent_ids": {},
+            "kg_ids": {},
+            "assigned_ids": {},
+        })
+        assert raw.kg_equivalent_ids == {}
 
 
 class TestMappingSummary:
@@ -183,6 +230,7 @@ class TestMappingResultFromBatchEntry:
             name="L-Histidine",
             curies=["RM:0129894", "CHEBI:15971"],
             chosen_kg_id="CHEBI:15971",
+            kg_equivalent_ids={"CHEBI": ["15971", "44637"], "HMDB": ["HMDB0000177"]},
             assigned_ids={
                 "kestrel-hybrid-search": {
                     "CHEBI": {"15971": {"score": 2.4898567923359374}}
@@ -196,6 +244,8 @@ class TestMappingResultFromBatchEntry:
         assert result.chosen_kg_id == "CHEBI:15971"
         assert result.confidence_score == pytest.approx(2.4898567923359374)
         assert result.ids_for("CHEBI") == ["15971"]
+        assert result.kg_equivalent_ids == {"CHEBI": ["15971", "44637"], "HMDB": ["HMDB0000177"]}
+        assert result.equivalent_ids_for("HMDB") == ["HMDB0000177"]
         assert result.raw_response is None
         assert result.error is None
 

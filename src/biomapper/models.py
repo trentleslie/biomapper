@@ -53,6 +53,7 @@ class RawApiResult(BaseModel):
     name: str | None = None
     curies: list[str] = Field(default_factory=list)
     chosen_kg_id: str | None = None
+    kg_equivalent_ids: dict[str, list[str]] = Field(default_factory=dict)
     kg_ids: dict[str, list[str]] = Field(default_factory=dict)
     assigned_ids: dict[str, dict[str, dict[str, Any]]] = Field(default_factory=dict)
     error: str | None = None
@@ -138,6 +139,7 @@ class MappingResult(BaseModel):
     chosen_kg_id: str | None = None
     confidence_score: float | None = None
     identifiers: dict[str, list[str]] = Field(default_factory=dict)
+    kg_equivalent_ids: dict[str, list[str]] = Field(default_factory=dict)
     hmdb_hint: str | None = None
     error: str | None = None
     raw_response: RawApiResponse | None = None
@@ -240,6 +242,7 @@ class MappingResult(BaseModel):
             base["primary_curie"] = r.curies[0]
 
         base["chosen_kg_id"] = r.chosen_kg_id
+        base["kg_equivalent_ids"] = dict(r.kg_equivalent_ids)
 
         # Flatten assigned_ids → {vocab: [code, ...]} and extract best score
         identifiers: dict[str, list[str]] = {}
@@ -262,6 +265,16 @@ class MappingResult(BaseModel):
     # ------------------------------------------------------------------
     # Convenience accessors
     # ------------------------------------------------------------------
+
+    def equivalent_ids_for(self, prefix: str) -> list[str]:
+        """Return equivalent IDs for the given CURIE prefix.
+
+        Example::
+
+            result.equivalent_ids_for("HMDB")   # ["HMDB0000067"]
+            result.equivalent_ids_for("LM")     # ["ST01010001", "ST01010093"]
+        """
+        return self.kg_equivalent_ids.get(prefix, [])
 
     def ids_for(self, vocab: str) -> list[str]:
         """Return all identifiers for the given vocabulary prefix.

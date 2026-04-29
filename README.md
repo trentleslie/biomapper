@@ -10,6 +10,7 @@ result = map_entity("L-Histidine")
 print(result.primary_curie)     # RM:0129894
 print(result.confidence_tier)   # high
 print(result.ids_for("CHEBI"))  # ['15971']
+print(result.equivalent_ids_for("HMDB"))  # ['HMDB0000177']
 ```
 
 ---
@@ -58,6 +59,10 @@ print(result.confidence_score)  # 2.489
 print(result.confidence_tier)   # high  (≥2.0)
 print(result.ids_for("CHEBI"))  # ['15971']
 print(result.ids_for("refmet_id"))  # ['RM0129894']
+
+# KG equivalent IDs — all identifiers from the resolved knowledge graph node
+print(result.kg_equivalent_ids)            # {'CHEBI': ['15971', '44637'], 'HMDB': ['HMDB0000177'], ...}
+print(result.equivalent_ids_for("HMDB"))   # ['HMDB0000177']
 ```
 
 ### Batch mapping (synchronous)
@@ -209,6 +214,7 @@ extract_hmdb_id(None)                                         # None
 | `confidence_score` | `float \| None` | Highest score across annotators |
 | `confidence_tier` | `str` | `"high"` (≥2.0) / `"medium"` (1–2) / `"low"` (<1) / `"unknown"` |
 | `identifiers` | `dict[str, list[str]]` | Vocabulary → IDs, e.g. `{"CHEBI": ["15971"]}` |
+| `kg_equivalent_ids` | `dict[str, list[str]]` | All equivalent IDs from the resolved KG node, by CURIE prefix |
 | `hmdb_hint` | `str \| None` | HMDB hint passed in the request |
 | `error` | `str \| None` | Error message if mapping failed |
 
@@ -216,6 +222,10 @@ extract_hmdb_id(None)                                         # None
 result.ids_for("CHEBI")        # ['15971']
 result.ids_for("refmet_id")    # ['RM0129894']
 result.ids_for("PUBCHEM.COMPOUND")  # []
+
+# KG equivalent IDs — all identifiers from the resolved knowledge graph node
+result.equivalent_ids_for("HMDB")  # ['HMDB0000177']
+result.equivalent_ids_for("LM")   # ['ST01010001', 'ST01010093']
 ```
 
 ### `DatasetMappingResult`
