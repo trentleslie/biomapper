@@ -7,24 +7,24 @@ needs a test: nothing downstream would notice.
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
 
 import pandas as pd
 import pytest
 
 from biomapper.benchmarks.api_mapper import ApiMapper, BatchOrderMismatchError
 from biomapper.benchmarks.arms import IncompleteUnionError, require_complete_union
+from biomapper.benchmarks.runner import VocabRun
 from biomapper.benchmarks.suite import run_suite
 from biomapper.models import MappingResult
 
 
-@dataclass
-class _VocabRun:
-    """The subset of runner.VocabRun the union guard reads."""
-
-    ok: bool
-    output_tsv: str | None
-    error: str | None
+def _vocab_run(
+    vocab: str, *, ok: bool, output_tsv: str | None, error: str | None = None
+) -> VocabRun:
+    """A real ``VocabRun``, so a field rename in the production dataclass breaks these tests."""
+    return VocabRun(
+        vocab=vocab, ok=ok, output_tsv=output_tsv, stats=None, manifest=None, error=error
+    )
 
 
 def _mapper() -> ApiMapper:
@@ -53,6 +53,22 @@ def test_an_order_mismatch_warning_aborts_the_batch():
     message = str(excinfo.value)
     assert "BY POSITION" in message
     assert "Refusing the arm" in message
+
+
+def test_the_abort_message_is_not_duplicated():
+    """Substring assertions alone passed against a garbled, doubled message.
+
+    A bad line-split once duplicated the whole sentence inside the f-string concatenation. ruff and
+    mypy accept that silently — it is valid string concatenation — and the existing ``in message``
+    assertions still passed, so nothing in CI caught it. Two independent reviewers did. Pin the
+    shape, not just the substrings.
+    """
+    chunk = [{"name": "glucose"}, {"name": "alanine"}]
+    with pytest.raises(BatchOrderMismatchError) as excinfo:
+        ApiMapper._assert_batch_order([_order_warning("glucose", "alanine")], chunk)
+    message = str(excinfo.value)
+    for phrase in ("the API returned", "Refusing the", "First mismatch", "compare each prediction"):
+        assert message.count(phrase) == 1, f"{phrase!r} appears {message.count(phrase)} times"
 
 
 def test_unrelated_warnings_do_not_abort():
@@ -191,8 +207,8 @@ def test_a_failed_vocab_pass_withholds_the_union_metric():
     reports as successful. Nothing downstream could tell.
     """
     runs = {
-        "CHEBI": _VocabRun(ok=True, output_tsv="/tmp/chebi.tsv", error=None),
-        "HMDB": _VocabRun(ok=False, output_tsv=None, error="Server error (HTTP 503)"),
+        "CHEBI": _vocab_run("CHEBI", ok=True, output_tsv="/tmp/chebi.tsv"),
+        "HMDB": _vocab_run("HMDB", ok=False, output_tsv=None, error="Server error (HTTP 503)"),
     }
     with pytest.raises(IncompleteUnionError) as excinfo:
         require_complete_union(
@@ -206,15 +222,15 @@ def test_a_failed_vocab_pass_withholds_the_union_metric():
 
 def test_a_complete_set_of_passes_is_returned():
     runs = {
-        "CHEBI": _VocabRun(ok=True, output_tsv="/tmp/chebi.tsv", error=None),
-        "HMDB": _VocabRun(ok=True, output_tsv="/tmp/hmdb.tsv", error=None),
+        "CHEBI": _vocab_run("CHEBI", ok=True, output_tsv="/tmp/chebi.tsv"),
+        "HMDB": _vocab_run("HMDB", ok=True, output_tsv="/tmp/hmdb.tsv"),
     }
     assert len(require_complete_union(runs, key="k", target_vocabs=("CHEBI", "HMDB"))) == 2
 
 
 def test_an_ok_run_with_no_output_still_counts_as_failed():
     """ok=True with no TSV is not a usable pass; treating it as one would drop it silently."""
-    runs = {"CHEBI": _VocabRun(ok=True, output_tsv=None, error=None)}
+    runs = {"CHEBI": _vocab_run("CHEBI", ok=True, output_tsv=None)}
     with pytest.raises(IncompleteUnionError):
         require_complete_union(runs, key="k", target_vocabs=("CHEBI",))
 
