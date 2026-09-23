@@ -95,3 +95,22 @@ def test_sync_map_entity_rejects_an_out_of_range_bound_without_a_request(monkeyp
     monkeypatch.setenv("BIOMAPPER_API_KEY", "k")
     with pytest.raises(ValueError, match="kestrel_top_n"):
         biomapper.map_entity("Glucose", kestrel_top_n=999)
+
+
+def test_every_new_response_model_is_exported_from_the_package_root():
+    # KestrelRequestParams is reachable as KestrelSearchResult.request, so it is public whether
+    # or not the export list says so.
+    from biomapper import (  # noqa: F401
+        KestrelRequestParams,
+        KestrelSearchResult,
+        LipidResolution,
+        ResolutionCertificate,
+    )
+
+    for name in (
+        "ResolutionCertificate",
+        "LipidResolution",
+        "KestrelSearchResult",
+        "KestrelRequestParams",
+    ):
+        assert name in biomapper.__all__, name

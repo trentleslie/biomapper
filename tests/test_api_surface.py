@@ -351,3 +351,32 @@ async def test_dataset_stream_omits_unset_params(client, tmp_path: Path):
     assert "candidate_limit" not in params
     assert "kestrel_top_n" not in params
     assert "prefer_human" not in params
+
+
+# ---------------------------------------------------------------------------
+# Snapshot provenance reaches the user-facing result (Greptile review, PR #2)
+# ---------------------------------------------------------------------------
+
+
+def test_mapping_result_carries_the_snapshot_versions():
+    # Batch and dataset results keep no raw_response, so a field parsed into RawApiResult but
+    # never copied across is unreachable for those callers.
+    raw = RawApiResult.model_validate(
+        {
+            "name": "Glucose",
+            "curies": ["CHEBI:17234"],
+            "refmet_snapshot_version": "2026-08-07",
+            "tier_b_snapshot_version": "tb-1",
+        }
+    )
+    result = MappingResult.from_batch_entry(raw, query_name="Glucose")
+    assert result.refmet_snapshot_version == "2026-08-07"
+    assert result.tier_b_snapshot_version == "tb-1"
+
+
+def test_mapping_result_snapshot_versions_default_to_none():
+    result = MappingResult.from_batch_entry(
+        RawApiResult.model_validate({"name": "Glucose"}), query_name="Glucose"
+    )
+    assert result.refmet_snapshot_version is None
+    assert result.tier_b_snapshot_version is None

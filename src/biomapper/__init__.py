@@ -63,6 +63,7 @@ from biomapper.models import (
     AnnotatorInfo,
     DatasetMappingResult,
     EntityTypeInfo,
+    KestrelRequestParams,
     KestrelSearchResult,
     LipidResolution,
     MappingResult,
@@ -94,6 +95,7 @@ __all__ = [
     "ResolutionCertificate",
     "LipidResolution",
     "KestrelSearchResult",
+    "KestrelRequestParams",
     # Exceptions
     "BioMapperError",
     "BioMapperAuthError",

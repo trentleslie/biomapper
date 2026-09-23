@@ -269,6 +269,8 @@ class MappingResult(BaseModel):
     lipid_resolution: LipidResolution | None = None
     refmet_availability: str = "not_queried"
     refmet_source: str = "not_queried"
+    refmet_snapshot_version: str | None = None
+    tier_b_snapshot_version: str | None = None
     kestrel_results: list[KestrelSearchResult] | None = None
     hmdb_hint: str | None = None
     error: str | None = None
@@ -378,6 +380,10 @@ class MappingResult(BaseModel):
         base["lipid_resolution"] = r.lipid_resolution
         base["refmet_availability"] = r.refmet_availability
         base["refmet_source"] = r.refmet_source
+        # Batch and dataset-stream results carry no raw_response, so a field parsed into
+        # RawApiResult but not copied here is unreachable for those callers.
+        base["refmet_snapshot_version"] = r.refmet_snapshot_version
+        base["tier_b_snapshot_version"] = r.tier_b_snapshot_version
         base["kestrel_results"] = r.kestrel_results
 
         # Flatten assigned_ids → {vocab: [code, ...]} and extract best score

@@ -223,3 +223,58 @@ def test_harmonize_is_offline(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", _no_network)
     report = harmonize([_result("Glucose", "CHEBI:1")], [_result("D-glucose", "CHEBI:1")])
     assert report.n_links == 1
+
+
+# ---------------------------------------------------------------------------
+# Key and label integrity (Greptile review, PR #2)
+# ---------------------------------------------------------------------------
+
+
+def test_custom_key_sees_the_original_index_even_when_an_earlier_row_errored():
+    # The key must be computed once against the ORIGINAL position. Keying the error list on
+    # original indices and the surviving rows on compacted ones lets an errored row and a later
+    # successful row collide, so a link would be attributed to the entity that failed.
+    report = harmonize(
+        [_result("Glucose", error="boom"), _result("Glucose", "CHEBI:1")],
+        [_result("D-glucose", "CHEBI:1")],
+        key=lambda r, i: f"{r.query_name}#{i}",
+    )
+    assert report.a_errors == ("Glucose#0",)
+    assert report.links[0].a_key == "Glucose#1"
+
+
+def test_duplicate_keys_are_rejected_even_when_one_of_the_rows_errored():
+    # The uniqueness guard must span errored and resolved rows together; otherwise the same key
+    # appears in both a_errors and a link, describing two different entities.
+    with pytest.raises(ValueError, match="duplicate"):
+        harmonize(
+            [_result("Glucose", error="boom"), _result("Glucose", "CHEBI:1")],
+            [_result("D-glucose", "CHEBI:1")],
+        )
+
+
+def test_harmonize_rejects_two_cohorts_sharing_a_label():
+    # summary() keys on the labels; equal labels would silently drop the A-side counts.
+    with pytest.raises(ValueError, match="distinct"):
+        harmonize([_result("a", "CHEBI:1")], [_result("b", "CHEBI:1")], a_label="c", b_label="c")
+
+
+@pytest.mark.parametrize("reserved", ["n_links"])
+def test_harmonize_rejects_a_label_that_would_overwrite_a_summary_field(reserved):
+    with pytest.raises(ValueError, match="reserved"):
+        harmonize([_result("a", "CHEBI:1")], [_result("b", "CHEBI:1")], a_label=reserved)
+
+
+def test_summary_keeps_both_cohorts_and_the_link_count_separate():
+    summary = harmonize(
+        [_result("a", "CHEBI:1")], [_result("b", "CHEBI:1")], a_label="x", b_label="y"
+    ).summary()
+    assert set(summary) == {"n_links", "x", "y"}
+
+
+def test_harmonization_result_defends_the_label_invariant_when_built_directly():
+    from biomapper.harmonize import HarmonizationResult, OverlapResult
+
+    empty = OverlapResult((), 0, 0, 0, 0, 0, (), ())
+    with pytest.raises(ValueError, match="distinct"):
+        HarmonizationResult(empty, "same", "same", (), (), 0, 0)

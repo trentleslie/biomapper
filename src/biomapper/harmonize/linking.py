@@ -83,6 +83,52 @@ def link_by_intersection(
     )
 
 
+# Scalar fields `summary()` emits alongside the two per-cohort blocks. A cohort label equal to
+# one of these would overwrite it, so the label is rejected rather than allowed to corrupt the
+# summary's shape.
+_RESERVED_SUMMARY_KEYS: frozenset[str] = frozenset({"n_links"})
+
+
+def _require_distinct_labels(a_label: str, b_label: str) -> None:
+    """Reject cohort labels that would collide as keys in :meth:`HarmonizationResult.summary`."""
+    if a_label == b_label:
+        raise ValueError(
+            f"a_label and b_label must be distinct; both are {a_label!r}. They key the summary, "
+            "so equal labels would drop one cohort's counts."
+        )
+    for side, label in (("a_label", a_label), ("b_label", b_label)):
+        if label in _RESERVED_SUMMARY_KEYS:
+            raise ValueError(
+                f"{side}={label!r} is reserved: summary() emits it as a scalar field, so a cohort "
+                "under that label would overwrite it."
+            )
+
+
+def _keys_for(
+    results: Sequence[MappingResult],
+    key: Callable[[MappingResult, int], str] | None,
+) -> list[str]:
+    """Key every result ONCE, against its position in the ORIGINAL input.
+
+    Keying a filtered subset would renumber it. A custom index-based key would then hand the same
+    string to two different rows, and a link could be attributed to an entity that never produced
+    one, so every key in a side is derived here and reused everywhere downstream.
+    """
+    return [key(r, i) if key is not None else r.query_name for i, r in enumerate(results)]
+
+
+def _require_unique(keys: Sequence[str]) -> None:
+    """Reject duplicate keys. Two entities on one key means one of them is silently dropped."""
+    seen: set[str] = set()
+    for k in keys:
+        if k in seen:
+            raise ValueError(
+                f"duplicate key {k!r} in the input results. Two entities would collapse onto one "
+                "entry and one of them would be dropped. Pass key=... to disambiguate."
+            )
+        seen.add(k)
+
+
 def curie_sets_from_results(
     results: Iterable[MappingResult],
     key: Callable[[MappingResult, int], str] | None = None,
@@ -94,16 +140,13 @@ def curie_sets_from_results(
     pass a ``key`` callable (it receives the result and its index) when a cohort genuinely has
     repeated names.
     """
-    out: dict[str, frozenset[str]] = {}
-    for i, r in enumerate(results):
-        k = key(r, i) if key is not None else r.query_name
-        if k in out:
-            raise ValueError(
-                f"duplicate key {k!r} in the input results. Two entities would collapse onto one "
-                "entry and one of them would be dropped. Pass key=... to disambiguate."
-            )
-        out[k] = curie_set(r.chosen_kg_id, r.kg_equivalent_ids)
-    return out
+    materialized = list(results)
+    keys = _keys_for(materialized, key)
+    _require_unique(keys)
+    return {
+        k: curie_set(r.chosen_kg_id, r.kg_equivalent_ids)
+        for k, r in zip(keys, materialized, strict=True)
+    }
 
 
 @dataclass(frozen=True)
@@ -125,6 +168,11 @@ class HarmonizationResult:
     b_errors: tuple[str, ...]
     n_a_total: int
     n_b_total: int
+
+    def __post_init__(self) -> None:
+        # The labels key summary(); enforce that here so the invariant holds however the result
+        # was built, not only via harmonize().
+        _require_distinct_labels(self.a_label, self.b_label)
 
     # -- linking ---------------------------------------------------------
 
@@ -200,7 +248,12 @@ class HarmonizationResult:
         return (self.n_b_linked / self.n_b_comparable) if self.n_b_comparable else None
 
     def summary(self) -> dict[str, Any]:
-        """Counts-only summary, keyed by the two cohort labels. Safe to log or serialize."""
+        """Counts-only summary, keyed by the two cohort labels. Safe to log or serialize.
+
+        The labels are dictionary keys here, which is why :func:`harmonize` rejects labels that
+        are equal to each other or to a reserved field name: either would silently overwrite a
+        sibling entry and hand back a summary that is quietly missing a cohort.
+        """
         return {
             "n_links": self.n_links,
             self.a_label: {
@@ -222,20 +275,26 @@ class HarmonizationResult:
         }
 
 
-def _split_errors(
+def _partition_side(
     results: Sequence[MappingResult],
     key: Callable[[MappingResult, int], str] | None,
-) -> tuple[list[MappingResult], tuple[str, ...]]:
-    """Partition results into (mappable, errored-keys). An error is not a non-resolution."""
-    mappable: list[MappingResult] = []
+) -> tuple[dict[str, frozenset[str]], tuple[str, ...]]:
+    """Split one cohort into (linkable CURIE sets, errored keys), keying each row exactly once.
+
+    Uniqueness is enforced across errored AND resolved rows together. Checking only the resolved
+    subset would let one key appear in both ``a_errors`` and a link while describing two different
+    input entities. An error is not a non-resolution, so the two are partitioned, not merged.
+    """
+    keys = _keys_for(results, key)
+    _require_unique(keys)
+    curies: dict[str, frozenset[str]] = {}
     errored: list[str] = []
-    for i, r in enumerate(results):
-        k = key(r, i) if key is not None else r.query_name
+    for k, r in zip(keys, results, strict=True):
         if r.error:
             errored.append(k)
         else:
-            mappable.append(r)
-    return mappable, tuple(errored)
+            curies[k] = curie_set(r.chosen_kg_id, r.kg_equivalent_ids)
+    return curies, tuple(errored)
 
 
 def harmonize(
@@ -266,18 +325,13 @@ def harmonize(
         errored in ``a_errors`` / ``b_errors``. Neither is silently dropped.
 
     Raises:
-        ValueError: If either side has duplicate keys (see ``key``).
+        ValueError: If either side has duplicate keys (see ``key``), or if ``a_label`` and
+            ``b_label`` are equal or collide with a reserved ``summary()`` field.
     """
-    a_mappable, a_errors = _split_errors(a_results, key)
-    b_mappable, b_errors = _split_errors(b_results, key)
-
-    # The index passed to `key` is the position within the ERROR-FREE subset, so a custom key must
-    # not assume it lines up with the caller's original list. It stays unique, which is all the
-    # duplicate-key guard needs.
-    overlap = link_by_intersection(
-        curie_sets_from_results(a_mappable, key=key),
-        curie_sets_from_results(b_mappable, key=key),
-    )
+    _require_distinct_labels(a_label, b_label)
+    a_curies, a_errors = _partition_side(a_results, key)
+    b_curies, b_errors = _partition_side(b_results, key)
+    overlap = link_by_intersection(a_curies, b_curies)
     return HarmonizationResult(
         overlap=overlap,
         a_label=a_label,

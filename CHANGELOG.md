@@ -32,6 +32,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-equivalence. An entity whose mapping call errored is counted separately again, in
   `a_errors` / `b_errors`: "we do not know" is a different claim from "it did not resolve".
 
+  Keys are derived once per input row, against its position in the **original** list, so an
+  index-based custom `key` cannot hand the same string to an errored row and a later resolved
+  one. Uniqueness is enforced across errored and resolved rows together. Cohort labels key
+  `summary()`, so labels that are equal to each other or to a reserved field are rejected rather
+  than allowed to silently overwrite a sibling entry.
+
   `harmonize` is deliberately **not** re-exported at the package root. Binding that name on
   `biomapper` would shadow the `biomapper.harmonize` submodule and break
   `biomapper.harmonize.curie_set` for anyone who reaches for it the obvious way. Import it as
