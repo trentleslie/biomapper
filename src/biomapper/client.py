@@ -56,11 +56,29 @@ class BioMapperClient:
                 identifiers={"HMDB": "HMDB03349"},
             )
 
+    Usage (deployment with authentication disabled)::
+
+        async with BioMapperClient(anonymous=True) as client:
+            result = await client.map_entity("L-Histidine")
+
     Args:
         api_key:    BioMapper API key.  Defaults to ``BIOMAPPER_API_KEY`` env var.
         base_url:   API root URL.  Override for staging/local instances.
         timeout:    Per-request timeout in seconds.
+        anonymous:  Send no ``X-API-Key`` header at all. A BioMapper2 deployment with no keys
+                    configured is open, and the public KRAKEN endpoint is keyless by design.
+                    For those, requiring a key forces callers to invent a placeholder, which is
+                    worse than sending nothing: a placeholder becomes a 403 the moment auth is
+                    switched on, and it puts a secret-shaped string into argv and logs. Must be
+                    set explicitly — it is never inferred from a missing key, so a forgotten
+                    ``BIOMAPPER_API_KEY`` still fails loudly instead of silently downgrading to
+                    an unauthenticated call.
         httpx_kwargs: Extra kwargs forwarded to :class:`httpx.AsyncClient`.
+
+    Raises:
+        BioMapperConfigError: If no key is resolvable and ``anonymous`` is False, or if a key is
+            supplied together with ``anonymous=True`` — an ambiguous instruction where guessing
+            which was meant would either leak a key or silently drop one.
     """
 
     def __init__(
@@ -68,14 +86,23 @@ class BioMapperClient:
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        anonymous: bool = False,
         **httpx_kwargs: Any,  # noqa: ANN401 — forwarded to httpx.AsyncClient verbatim
     ) -> None:
         resolved_key = api_key or os.getenv("BIOMAPPER_API_KEY")
-        if not resolved_key:
+        if anonymous and api_key:
             raise BioMapperConfigError(
-                "No API key provided. Pass api_key= or set BIOMAPPER_API_KEY env var."
+                "anonymous=True was passed together with an explicit api_key. Refusing to guess "
+                "which one you meant: drop the key to go keyless, or drop anonymous=True to "
+                "authenticate."
             )
-        self._api_key = resolved_key
+        if not resolved_key and not anonymous:
+            raise BioMapperConfigError(
+                "No API key provided. Pass api_key=, set BIOMAPPER_API_KEY, or pass "
+                "anonymous=True for a deployment with authentication disabled."
+            )
+        self._anonymous = anonymous
+        self._api_key = None if anonymous else resolved_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._httpx_kwargs = httpx_kwargs
@@ -86,8 +113,12 @@ class BioMapperClient:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> BioMapperClient:
+        # No header at all when anonymous. An empty ``X-API-Key`` is a *present but unknown* key,
+        # which an authenticated deployment answers with 403 rather than the 401 that would tell
+        # the caller a key is needed.
+        headers = {} if self._anonymous else {"X-API-Key": self._api_key or ""}
         self._client = httpx.AsyncClient(
-            headers={"X-API-Key": self._api_key},
+            headers=headers,
             timeout=self._timeout,
             **self._httpx_kwargs,
         )
