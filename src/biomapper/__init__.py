@@ -31,6 +31,14 @@ Quick start::
     # Async (in an async context)
     async with BioMapperClient() as client:
         result = await client.map_entity("L-Histidine")
+
+    # Harmonize two already-resolved cohorts (local, offline, no extra requests).
+    # `harmonize` is deliberately NOT re-exported at the package root: the name would
+    # shadow the `biomapper.harmonize` submodule and break `biomapper.harmonize.curie_set`.
+    from biomapper.harmonize import harmonize
+
+    report = harmonize(ukbb_results, arivale_results, a_label="ukbb", b_label="arivale")
+    print(report.n_links, report.a_unresolved)
 """
 
 from biomapper.client import BioMapperClient
@@ -55,12 +63,15 @@ from biomapper.models import (
     AnnotatorInfo,
     DatasetMappingResult,
     EntityTypeInfo,
+    KestrelSearchResult,
+    LipidResolution,
     MappingResult,
     MappingSummary,
+    ResolutionCertificate,
     VocabularyInfo,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 __all__ = [
     # Client
@@ -80,6 +91,9 @@ __all__ = [
     "EntityTypeInfo",
     "AnnotatorInfo",
     "VocabularyInfo",
+    "ResolutionCertificate",
+    "LipidResolution",
+    "KestrelSearchResult",
     # Exceptions
     "BioMapperError",
     "BioMapperAuthError",

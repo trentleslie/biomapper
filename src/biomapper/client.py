@@ -231,9 +231,16 @@ class BioMapperClient:
         self,
         name: str,
         entity_type: str = "biolink:SmallMolecule",
-        identifiers: dict[str, str] | None = None,
+        identifiers: dict[str, str | list[str]] | None = None,
         annotation_mode: str = "missing",
         annotators: list[str] | None = None,
+        *,
+        vocab: str | list[str] | None = None,
+        array_delimiters: list[str] | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
     ) -> MappingResult:
         """Map a single entity name to standardized knowledge-graph identifiers.
 
@@ -247,19 +254,41 @@ class BioMapperClient:
             annotators:      Optional list of annotator names to use. When not
                              specified, BioMapper2 uses all available annotators.
                              Use ``["kestrel-vector-search"]`` for strict matching.
+            vocab:           Allowed vocabulary name(s) to map to, e.g. ``"refmet"``.
+            array_delimiters: Characters used to split delimited ID strings.
+            prefer_human:    For gene/protein entities, prefer the human (HGNC-bearing)
+                             candidate over a wrong-species ortholog. Server default ``True``.
+            prefer_canonical: For non-gene categories with a canonical-namespace policy,
+                             prefer the canonical-namespace node. Server default ``True``.
+            candidate_limit: Candidates each Kestrel search annotator retrieves (1..100).
+            kestrel_top_n:   Opt in to raw Kestrel passthrough rows on
+                             :attr:`MappingResult.kestrel_results` (1..100). Passthrough only:
+                             it never changes ``chosen_kg_id``, ``assigned_ids`` or the
+                             certificate.
+
+        Any option left as ``None`` is omitted from the request, so the server's own default
+        applies and the payload is unchanged for callers who do not use these.
 
         Returns:
             A :class:`~biomapper.models.MappingResult` with resolved identifiers.
 
         Raises:
+            ValueError: If ``candidate_limit`` or ``kestrel_top_n`` is outside 1..100.
             BioMapperAuthError: If the API key is rejected.
             BioMapperRateLimitError: If the API signals throttling.
             BioMapperServerError: For unrecoverable 5xx errors.
             BioMapperTimeoutError: If the request times out.
         """
-        options: dict[str, Any] = {"annotation_mode": annotation_mode}
-        if annotators is not None:
-            options["annotators"] = annotators
+        options = self._build_options(
+            annotation_mode,
+            annotators,
+            vocab=vocab,
+            array_delimiters=array_delimiters,
+            prefer_human=prefer_human,
+            prefer_canonical=prefer_canonical,
+            candidate_limit=candidate_limit,
+            kestrel_top_n=kestrel_top_n,
+        )
 
         payload = MapEntityRequest(
             name=name,
@@ -268,7 +297,7 @@ class BioMapperClient:
             options=options,
         )
 
-        hmdb_hint: str | None = (identifiers or {}).get("HMDB")
+        hmdb_hint = self._hmdb_hint(identifiers or {})
 
         try:
             response = await self._http.post(
@@ -289,6 +318,13 @@ class BioMapperClient:
         annotation_mode: str = "missing",
         annotators: list[str] | None = None,
         progress: bool = False,
+        *,
+        vocab: str | list[str] | None = None,
+        array_delimiters: list[str] | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
     ) -> list[MappingResult]:
         """Map a batch of entity records via the native ``/map/batch`` endpoint.
 
@@ -331,12 +367,25 @@ class BioMapperClient:
         """
         records = list(records)  # materialize so generators work and len() is safe
 
+        # Built once: the option block is identical for every record, and building it here means
+        # an out-of-range bound raises before any request is sent rather than per chunk.
+        options = self._build_options(
+            annotation_mode,
+            annotators,
+            vocab=vocab,
+            array_delimiters=array_delimiters,
+            prefer_human=prefer_human,
+            prefer_canonical=prefer_canonical,
+            candidate_limit=candidate_limit,
+            kestrel_top_n=kestrel_top_n,
+        )
+
         requests = [
             MapEntityRequest(
                 name=str(r.get("name", "")),
                 entity_type=entity_type,
                 identifiers=dict(r.get("identifiers") or {}),
-                options=self._build_options(annotation_mode, annotators),
+                options=dict(options),
             )
             for r in records
         ]
@@ -387,7 +436,7 @@ class BioMapperClient:
                             MappingResult.from_batch_entry(
                                 raw,
                                 query_name=req.name,
-                                hmdb_hint=req.identifiers.get("HMDB"),
+                                hmdb_hint=self._hmdb_hint(req.identifiers),
                             )
                         )
                 except asyncio.CancelledError:
@@ -397,7 +446,7 @@ class BioMapperClient:
                         results.append(
                             MappingResult(
                                 query_name=req.name,
-                                hmdb_hint=req.identifiers.get("HMDB"),
+                                hmdb_hint=self._hmdb_hint(req.identifiers),
                                 error=str(exc),
                             )
                         )
@@ -416,12 +465,56 @@ class BioMapperClient:
         return results
 
     @staticmethod
+    def _hmdb_hint(identifiers: dict[str, str | list[str]]) -> str | None:
+        """Echo back the HMDB hint. The API accepts a list per vocabulary, so unwrap one."""
+        value = identifiers.get("HMDB")
+        if isinstance(value, list):
+            return str(value[0]) if value else None
+        return value
+
+    @staticmethod
+    def _check_bounds(name: str, value: int | None) -> None:
+        """Reject an out-of-range 1..100 option locally.
+
+        The API bounds ``candidate_limit`` and ``kestrel_top_n`` to 1..100 and answers 422.
+        Failing here turns a wasted round trip into an immediate, self-describing error.
+        """
+        if value is not None and not (1 <= value <= 100):
+            raise ValueError(f"{name} must be between 1 and 100, got {value}")
+
+    @staticmethod
     def _build_options(
-        annotation_mode: str, annotators: list[str] | None
+        annotation_mode: str,
+        annotators: list[str] | None,
+        *,
+        vocab: str | list[str] | None = None,
+        array_delimiters: list[str] | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
     ) -> dict[str, Any]:
+        """Assemble the ``options`` block, omitting anything the caller left unset.
+
+        An unset option is left out entirely rather than sent as ``None``, so the server's own
+        default governs and the wire payload stays byte-identical to the pre-existing one for
+        callers who pass nothing new.
+        """
+        BioMapperClient._check_bounds("candidate_limit", candidate_limit)
+        BioMapperClient._check_bounds("kestrel_top_n", kestrel_top_n)
+
         options: dict[str, Any] = {"annotation_mode": annotation_mode}
-        if annotators is not None:
-            options["annotators"] = annotators
+        for key, value in (
+            ("annotators", annotators),
+            ("vocab", vocab),
+            ("array_delimiters", array_delimiters),
+            ("prefer_human", prefer_human),
+            ("prefer_canonical", prefer_canonical),
+            ("candidate_limit", candidate_limit),
+            ("kestrel_top_n", kestrel_top_n),
+        ):
+            if value is not None:
+                options[key] = value
         return options
 
     async def map_dataset_file_iter(
@@ -434,6 +527,10 @@ class BioMapperClient:
         annotation_mode: str = "missing",
         annotators: list[str] | None = None,
         vocab: str | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
     ) -> AsyncGenerator[MappingResult, None]:
         """Stream per-row mapping results from ``POST /map/dataset/stream``.
 
@@ -511,6 +608,10 @@ class BioMapperClient:
             annotation_mode=annotation_mode,
             annotators=annotators,
             vocab=vocab,
+            prefer_human=prefer_human,
+            prefer_canonical=prefer_canonical,
+            candidate_limit=candidate_limit,
+            kestrel_top_n=kestrel_top_n,
         )
         content_type = self._dataset_content_type(path)
 
@@ -568,6 +669,10 @@ class BioMapperClient:
         annotation_mode: str,
         annotators: list[str] | None,
         vocab: str | None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
     ) -> dict[str, str]:
         """Serialize dataset endpoint query params.
 
@@ -575,10 +680,16 @@ class BioMapperClient:
         the wire form. Commas inside any value are rejected as a ``ValueError``
         at the boundary — silently splitting ``"iupac,name"`` into two
         columns would corrupt the request undetectably.
+
+        The dataset routes take the mapping options as query params rather than an options
+        object, and ``array_delimiters`` is not among them, so it has no dataset equivalent.
+        An option left as ``None`` is omitted so the server default applies.
         """
         BioMapperClient._reject_commas("provided_id_columns", provided_id_columns)
         if annotators is not None:
             BioMapperClient._reject_commas("annotators", annotators)
+        BioMapperClient._check_bounds("candidate_limit", candidate_limit)
+        BioMapperClient._check_bounds("kestrel_top_n", kestrel_top_n)
 
         params: dict[str, str] = {
             "entity_type": entity_type,
@@ -590,6 +701,15 @@ class BioMapperClient:
             params["annotators"] = ",".join(annotators)
         if vocab is not None:
             params["vocab"] = vocab
+        # Booleans go on the wire lowercased, which is what FastAPI's bool parser expects.
+        if prefer_human is not None:
+            params["prefer_human"] = str(prefer_human).lower()
+        if prefer_canonical is not None:
+            params["prefer_canonical"] = str(prefer_canonical).lower()
+        if candidate_limit is not None:
+            params["candidate_limit"] = str(candidate_limit)
+        if kestrel_top_n is not None:
+            params["kestrel_top_n"] = str(kestrel_top_n)
         return params
 
     @staticmethod

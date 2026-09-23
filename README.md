@@ -204,6 +204,46 @@ extract_hmdb_id(None)                                         # None
 
 ---
 
+## Harmonization (cross-dataset equivalence)
+
+`biomapper.harmonize` links two **already-resolved** datasets locally. Two entities, one per
+cohort, are equivalent when they resolve to the same canonical KRAKEN node. It is an
+identifier-set intersection, never string matching, and it runs entirely on the client: no extra
+requests, no knowledge-graph access, so it works offline and is fully testable without a network.
+
+```python
+from biomapper import map_entities
+from biomapper.harmonize import harmonize
+
+ukbb    = map_entities([{"name": "Glucose"},   {"name": "Urea"}])
+arivale = map_entities([{"name": "D-glucose"}, {"name": "X-12345"}])
+
+report = harmonize(ukbb, arivale, a_label="ukbb", b_label="arivale")
+
+report.n_links          # 1
+report.links[0].shared  # frozenset({'CHEBI:17234', 'KEGG:C00031'}) — what formed the link
+report.b_unresolved     # ('X-12345',) — a refusal candidate, never silently dropped
+report.summary()
+```
+
+Two rules the linker is built around:
+
+1. **Identifier-only.** `INCHIKEY`, `INCHI` and `SMILES` are excluded. Linking on a structure
+   hash would make any downstream structural certificate circular and would make precision 100%
+   by construction.
+2. **Prefix synonyms normalize.** `KEGG.COMPOUND:C00031` equals `KEGG:C00031`; genuinely
+   different identifier spaces such as `KEGG.GLYCAN` stay distinct.
+
+An entity that resolved to nothing is a **refusal candidate, not a link**. It is named in
+`a_unresolved` / `b_unresolved`, counted in `summary()`, and left out of the link-rate
+denominator so non-resolution is never scored as non-equivalence. An entity whose mapping call
+errored is tracked separately again in `a_errors` / `b_errors`.
+
+Import it as `from biomapper.harmonize import harmonize`. The name is deliberately not bound on
+the package root, where it would shadow the submodule.
+
+---
+
 ## API reference
 
 ### `MappingResult`
