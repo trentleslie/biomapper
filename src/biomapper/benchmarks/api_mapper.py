@@ -508,11 +508,16 @@ class ApiMapper:
             prediction_rows.append(row)
 
         # Backstop, not a currently-reachable path: the client emits the mismatch as a WARNING and
-        # still appends a normal result, so today it is always caught in `_map_chunk`. This exists
-        # because that interception depends on `warnings.catch_warnings`, which mutates global
-        # filter state and only holds while chunks are mapped sequentially. If a caller has
-        # globally turned warnings into errors, or chunk mapping is ever parallelized, the warning
-        # can surface as a per-record error instead — which is the shape this catches.
+        # still appends a normal result, so today it is always caught in `_map_chunk`.
+        #
+        # Reaching this check needs BOTH of two things at once, not either alone. Parallelizing
+        # chunk mapping alone is not enough: under ordinary warning settings the client still
+        # appends a normal result and never populates `error`. A global warnings-as-errors setting
+        # alone is not enough either: the `simplefilter("always")` inside our own
+        # `catch_warnings` block overrides it. It takes parallel mapping AND warnings raised as
+        # errors — then one task's filter state can leak into another's `map_entities` call, the
+        # warning raises inside the client's broad `except`, and it lands as a per-record error.
+        # Narrow, but cheap to guard, and the alternative is a silently mis-scored arm.
         order_errors = [
             r.error for r in results if r.error and "Batch order mismatch" in r.error
         ]

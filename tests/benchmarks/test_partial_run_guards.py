@@ -67,7 +67,14 @@ def test_the_abort_message_is_not_duplicated():
     with pytest.raises(BatchOrderMismatchError) as excinfo:
         ApiMapper._assert_batch_order([_order_warning("glucose", "alanine")], chunk)
     message = str(excinfo.value)
-    for phrase in ("the API returned", "Refusing the", "First mismatch", "compare each prediction"):
+    for phrase in (
+        "the API returned",
+        "predictions are joined",
+        "BY POSITION",
+        "compare each prediction",
+        "Refusing the",
+        "First mismatch",
+    ):
         assert message.count(phrase) == 1, f"{phrase!r} appears {message.count(phrase)} times"
 
 
