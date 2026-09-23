@@ -136,12 +136,26 @@ for et in list_entity_types():
 
 ### Tuning resolution
 
-Every mapping call accepts the API's resolution options as keyword arguments. An option you do not
+The mapping calls accept the API's resolution options as keyword arguments. An option you do not
 pass is **omitted from the request**, so the server's own default applies and the payload is
 unchanged for callers who ignore them.
 
+Coverage is uneven, so check this before reaching for one. Passing an option to a call that does
+not accept it raises `TypeError` locally, before any request:
+
+| | `vocab` | `prefer_human` | `prefer_canonical` | `candidate_limit` | `kestrel_top_n` | `array_delimiters` |
+|---|---|---|---|---|---|---|
+| `map_entity`, `map_entities` (sync and async) | yes | yes | yes | yes | yes | yes |
+| `BioMapperClient.map_dataset_file_iter` (async) | yes | yes | yes | yes | yes | no |
+| `map_dataset_file_sync` | yes | no | no | no | no | no |
+
+`array_delimiters` is absent from the dataset routes because the API does not accept it there. The
+four missing from `map_dataset_file_sync` are a gap in that wrapper rather than an API limitation:
+the async `map_dataset_file_iter` underneath it does accept them, so use that directly if you need
+them on a file-based run.
+
 ```python
-from biomapper import map_entity
+from biomapper import map_entity  # map_entity / map_entities accept all six
 
 result = map_entity(
     "PC 34:1",
