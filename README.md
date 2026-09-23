@@ -134,6 +134,78 @@ for et in list_entity_types():
         print(f"  prefixes: {', '.join(et.default_prefixes)}")
 ```
 
+### Tuning resolution
+
+The mapping calls accept the API's resolution options as keyword arguments. An option you do not
+pass is **omitted from the request**, so the server's own default applies and the payload is
+unchanged for callers who ignore them.
+
+Coverage is uneven, so check this before reaching for one. Passing an option to a call that does
+not accept it raises `TypeError` locally, before any request:
+
+| | `vocab` | `prefer_human` | `prefer_canonical` | `candidate_limit` | `kestrel_top_n` | `array_delimiters` |
+|---|---|---|---|---|---|---|
+| `map_entity`, `map_entities` (sync and async) | yes | yes | yes | yes | yes | yes |
+| `BioMapperClient.map_dataset_file_iter` (async) | yes | yes | yes | yes | yes | no |
+| `map_dataset_file_sync` | yes | no | no | no | no | no |
+
+`array_delimiters` is absent from the dataset routes because the API does not accept it there. The
+four missing from `map_dataset_file_sync` are a gap in that wrapper rather than an API limitation:
+the async `map_dataset_file_iter` underneath it does accept them, so use that directly if you need
+them on a file-based run.
+
+```python
+from biomapper import map_entity  # map_entity / map_entities accept all six
+
+result = map_entity(
+    "PC 34:1",
+    vocab="refmet",             # restrict to one vocabulary (or a list)
+    prefer_human=False,         # gene/protein: allow a non-human ortholog to win
+    prefer_canonical=False,     # non-gene: allow a non-canonical-namespace node to win
+    candidate_limit=20,         # candidates each Kestrel search annotator retrieves (1..100)
+    array_delimiters=["|"],     # how delimited ID strings are split
+    kestrel_top_n=5,            # opt in to raw Kestrel passthrough rows (1..100)
+)
+```
+
+| Option | Applies to | Default | Notes |
+|---|---|---|---|
+| `vocab` | all | server | `str` or `list[str]`, e.g. `"refmet"` |
+| `prefer_human` | gene/protein | `True` (server) | Prefer the human, HGNC-bearing candidate over a wrong-species ortholog |
+| `prefer_canonical` | non-gene | `True` (server) | Prefer the canonical-namespace node (CHEBI/HMDB/RefMet) over a same-text node from UMLS/ICD/KEGG |
+| `candidate_limit` | all | server | 1..100. Validated client-side, so an out-of-range value raises `ValueError` before the request |
+| `kestrel_top_n` | all | off | 1..100. Passthrough only: it **never** changes `chosen_kg_id`, `assigned_ids` or the certificate |
+| `array_delimiters` | `map_entity`, `map_entities` | `[",", ";"]` | Not accepted by the dataset routes |
+
+`kestrel_top_n` populates `result.kestrel_results` with the raw rows Kestrel returned, exactly as
+returned, for each search endpoint the pipeline used. Those rows are **untrusted external data**:
+treat every field as unescaped and unverified.
+
+### Resolution certificates and refusal
+
+A mapping result carries the structural certificate the API computed for `chosen_kg_id`, which is
+how you tell "we could not check this" apart from "we checked and disagree".
+
+```python
+result = map_entity("cortisone")
+
+cert = result.certificate
+if cert is not None:
+    print(cert.state)                    # corroborated | uncorroborated | contradicted |
+                                         # unavailable | not_applicable
+    print(cert.independent_source)       # registry consulted, e.g. "pubchem"
+    print(cert.independent_of_selection)  # False => corroboration would be circular
+    print(cert.refmet_availability)      # voted | no_match | unavailable | not_queried
+
+# Why the resolver declined, when it did. Distinct from `error`:
+# an error means the call failed; a refusal means the pipeline ran and declined to assert.
+print(result.refusal_reason)
+```
+
+`state="contradicted"` means a human should look, not that the resolver is wrong: a name lookup at
+an external registry can itself return a related-but-different compound. `state="unavailable"`
+means there was nothing to check against, which is unverifiable rather than wrong.
+
 ### Async usage
 
 ```python
@@ -259,6 +331,14 @@ the package root, where it would shadow the submodule.
 | `confidence_tier` | `str` | `"high"` (≥2.0) / `"medium"` (1–2) / `"low"` (<1) / `"unknown"` |
 | `identifiers` | `dict[str, list[str]]` | Vocabulary → IDs, e.g. `{"CHEBI": ["15971"]}` |
 | `kg_equivalent_ids` | `dict[str, list[str]]` | All equivalent IDs from the resolved KG node, by CURIE prefix |
+| `certificate` | `ResolutionCertificate \| None` | Structural certificate for `chosen_kg_id` (state, independent source, RefMet provenance) |
+| `refusal_reason` | `str \| None` | Why the resolver declined, read from the certificate. `None` when there is no certificate |
+| `lipid_resolution` | `LipidResolution \| None` | Lipid hierarchy detail (goslin parse, `mapping_relation`); `None` for non-lipid rows |
+| `refmet_availability` | `str` | `"voted"` / `"no_match"` / `"unavailable"` / `"not_queried"` |
+| `refmet_source` | `str` | `"local_snapshot"` / `"not_in_snapshot"` / `"live_api"` / `"unavailable"` / `"not_queried"` |
+| `refmet_snapshot_version` | `str \| None` | Pinned RefMet freeze that served the row |
+| `tier_b_snapshot_version` | `str \| None` | Tier B freeze that produced a frozen independent result |
+| `kestrel_results` | `list[KestrelSearchResult] \| None` | Raw passthrough rows; only when `kestrel_top_n` was set |
 | `hmdb_hint` | `str \| None` | HMDB hint passed in the request |
 | `error` | `str \| None` | Error message if mapping failed |
 
