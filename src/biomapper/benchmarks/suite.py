@@ -117,17 +117,31 @@ def run_suite(
                 provenance=provenance,
                 kestrel_url=kestrel_url,
             )
+            arm_status = record.get("arm_status")
+            # An arm with several sub-arms (MetaBench subgroups, MetaboliteAnnotator ion modes)
+            # can complete one and fail another. Reporting that as "ok" made n_ok count it, left
+            # n_failed at zero and let the CLI exit green while part of the declared benchmark was
+            # missing. "partial" is its own status for exactly that case: it is not a success, and
+            # it is not the same as an arm that produced nothing.
+            failed_sub_arms = (
+                sorted(k for k, v in arm_status.items() if v != "ok") if arm_status else []
+            )
             entry = {
                 "dataset": key,
-                "status": "ok",
+                "status": "partial" if failed_sub_arms else "ok",
                 "out_dir": record.get("out_dir", ""),
                 "role": record.get("role"),
                 "headline": _headline(record),
             }
-            if record.get("arm_status") is not None:
-                # An arm with several sub-arms can complete one and fail another; without this the
-                # dataset-level status reads "ok" while a failure sits invisible on disk.
-                entry["arm_status"] = record["arm_status"]
+            if arm_status is not None:
+                entry["arm_status"] = arm_status
+            if failed_sub_arms:
+                entry["failed_sub_arms"] = failed_sub_arms
+                entry["reason"] = (
+                    f"{len(failed_sub_arms)} of {len(arm_status)} sub-arm(s) failed "
+                    f"({', '.join(failed_sub_arms)}); the reported numbers cover only the "
+                    f"sub-arms that completed."
+                )
             entry["request_counters"] = mapper.counters.snapshot()
             results.append(entry)
         except SourceUnavailable as exc:
@@ -183,8 +197,12 @@ def run_suite(
         "circularity": circularity_notes(kg, datasets),
         "datasets": results,
         "n_ok": sum(1 for r in results if r["status"] == "ok"),
+        "n_partial": sum(1 for r in results if r["status"] == "partial"),
         "n_failed": sum(1 for r in results if r["status"] == "failed"),
         "n_skipped": sum(1 for r in results if r["status"] == "skipped"),
+        # True only when every attempted arm completed every sub-arm. A scheduled run should read
+        # this rather than n_failed alone.
+        "complete": not any(r["status"] in ("failed", "partial") for r in results),
     }
 
     if probe_live:
@@ -258,7 +276,8 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         f"- Provenance pinned: {pins['provenance_pinned']}",
         f"- KG stable during run: {manifest.get('kg_stable_during_run', 'not probed')}",
         "",
-        f"{manifest['n_ok']} ok, {manifest['n_failed']} failed, {manifest['n_skipped']} skipped.",
+        f"{manifest['n_ok']} ok, {manifest['n_partial']} partial, {manifest['n_failed']} failed, "
+        f"{manifest['n_skipped']} skipped.",
         "",
         "## Arms",
         "",
@@ -281,6 +300,8 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         "- Gene arms report accuracy PER TARGET NAMESPACE. The any-namespace roll-up is emitted",
         "  flagged non-quotable.",
         "- A `skipped` arm has a reason. It is not a zero and not a pass.",
+        "- A `partial` arm completed some sub-arms and not others. Its numbers cover only what",
+        "  completed, so they are not the full benchmark.",
         "",
         f"Generated {dt.datetime.now(dt.UTC).isoformat()}.",
     ]

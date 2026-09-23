@@ -113,10 +113,16 @@ def main(argv: list[str] | None = None) -> int:
     for entry in manifest["datasets"]:
         note = entry.get("reason") or entry.get("error") or ""
         print(f"  {entry['status']:8s} {entry['dataset']:24s} {note}")
+    if not manifest.get("complete", True):
+        print(
+            "\nINCOMPLETE: at least one arm failed or completed only part of its sub-arms. "
+            "The numbers above do not cover the full benchmark."
+        )
 
-    # A failed arm is a non-zero exit so a scheduled run is not reported as green. A SKIP is not a
-    # failure: it is a recorded, deliberate outcome with a reason attached.
-    return 1 if manifest["n_failed"] else 0
+    # A failed OR PARTIAL arm is a non-zero exit, so a scheduled run is not reported as green when
+    # part of the declared benchmark is missing. A SKIP is not a failure: it is a recorded,
+    # deliberate outcome with a reason attached.
+    return 1 if (manifest["n_failed"] or manifest["n_partial"]) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

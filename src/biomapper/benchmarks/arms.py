@@ -60,6 +60,16 @@ from biomapper.benchmarks.structure import NameStructureResolver
 logger = logging.getLogger(__name__)
 
 
+class IncompleteUnionError(RuntimeError):
+    """A metric defined as the union across every target vocabulary lost one of its passes.
+
+    The MetaboliteAnnotator name-hit rate and the metLinkR link rate are both defined as "resolved
+    in ANY target vocabulary". If the HMDB pass fails and the rest are scored anyway, an HMDB-only
+    hit silently becomes a miss and the arm reports a DEFLATED number as a successful result. A
+    partial union is not a conservative estimate, it is a wrong one, so the arm is refused.
+    """
+
+
 class UnscorableRunError(RuntimeError):
     """An arm completed but produced nothing scorable.
 
@@ -97,6 +107,26 @@ def _build_oracle(
         name_fallback=NameStructureResolver() if name_fallback else None,
         node_names=NodeNameResolver(kestrel_url) if name_fallback else None,
     )
+
+
+def require_complete_union(
+    runs: dict[str, Any], *, key: str, target_vocabs: tuple[str, ...]
+) -> list[Any]:
+    """Return every vocab pass, refusing the arm if any of them failed.
+
+    For a metric defined as "resolved in ANY target vocabulary", a missing pass can only turn real
+    hits into misses. Scoring the remainder yields a deflated number that still reports as a
+    success, so the arm is refused instead. Used by the two union-shaped arms
+    (MetaboliteAnnotator's name-hit rate, metLinkR's link rate).
+    """
+    failed = {vocab: run.error for vocab, run in runs.items() if not (run.ok and run.output_tsv)}
+    if failed:
+        raise IncompleteUnionError(
+            f"{key}: target vocab pass(es) {sorted(failed)} failed, so the union across "
+            f"{list(target_vocabs)} is incomplete and the metric would be deflated. Withholding "
+            f"it rather than reporting a number computed from a subset. Errors: {failed}"
+        )
+    return list(runs.values())
 
 
 def _primary_run(runs: dict[str, Any], config: Any) -> tuple[str, pd.DataFrame]:  # noqa: ANN401 - any of the five heterogeneous dataset-config types
@@ -364,11 +394,8 @@ def run_metaboliteannotator(
                 dataset_sha=bundle.card["source_sha256"],
                 provenance=provenance,
             )
-            ok = [r for r in runs.values() if r.ok and r.output_tsv]
-            if not ok:
-                raise RuntimeError(
-                    f"no target vocab produced a result: {[r.error for r in runs.values()]}"
-                )
+            # Every configured pass is required: the name-hit rate is the union across them.
+            ok = require_complete_union(runs, key=key, target_vocabs=config.target_vocabs)
             merged = merge_vocab_runs(
                 [pd.read_csv(str(r.output_tsv), sep="\t") for r in ok], config
             )
@@ -417,11 +444,9 @@ def run_metlinkr(
         dataset_sha=bundle.card["source_sha256"],
         provenance=provenance,
     )
-    ok = [r for r in runs.values() if r.ok and r.output_tsv]
-    if not ok:
-        raise RuntimeError(
-            f"metLinkR: no target vocab produced a result: {[r.error for r in runs.values()]}"
-        )
+    # A link is confirmed when two members share a canonical id in ANY target vocab, so a missing
+    # pass can only turn real links into misses.
+    ok = require_complete_union(runs, key=METLINKR.key, target_vocabs=METLINKR.target_vocabs)
     merged = merge_vocab_runs([pd.read_csv(str(r.output_tsv), sep="\t") for r in ok], METLINKR)
     oracle = _build_oracle(mapper, merged, kestrel_url=kestrel_url)
     result = score_metlinkr(merged, METLINKR, oracle=oracle)
@@ -734,6 +759,13 @@ def run_metabench(
     # the 1,000-pair set has to travel with the number or it reads as the full benchmark.
     result["subgroup_status"] = subgroup_status
     result["rows_scored_of_source"] = {"scored": len(mapped_df), "source_rows": len(bundle.long_df)}
+    result["complete"] = all(v == "ok" for v in subgroup_status.values())
+    if not result["complete"]:
+        result["incomplete_reason"] = (
+            "one or more subgroups failed, so this accuracy covers fewer than the declared "
+            "1,000 grounding pairs. See subgroup_status and rows_scored_of_source; do not quote "
+            "it as the full benchmark."
+        )
     _write(out_dir / "results.json", result)
     return {
         "out_dir": str(out_dir),

@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,18 @@ class TrivialMappingError(RuntimeError):
     Name-only input with ``annotation_mode='all'`` must resolve through the annotate path.
     Zero assigned mappings means the gold column reached the mapper as a provided id, which
     would score a trivial 100%. Refuse the run.
+    """
+
+
+class BatchOrderMismatchError(RuntimeError):
+    """The API returned batch results in a different order than they were sent.
+
+    Fatal here, where it is merely a warning in the client. Predictions are joined to the
+    held-out gold columns BY POSITION, so a reordered response scores each prediction against a
+    different entity's gold — silently, and in a direction that could go either way. There is no
+    stable per-row identity on the wire to realign by (the response echoes a name, which is not
+    unique across a dataset: the MetaboliteAnnotator arms legitimately carry the same name in
+    several accessions). So the only safe response is to refuse the arm.
     """
 
 
@@ -377,16 +390,26 @@ class ApiMapper:
         for attempt in range(self.max_retries):
             self.counters.batches += 1
             try:
-                last = await client.map_entities(
-                    chunk,
-                    entity_type=entity_type,
-                    annotation_mode=annotation_mode,
-                    annotators=annotators,
-                    vocab=vocab,
-                    prefer_canonical=prefer_canonical,
-                    prefer_human=prefer_human,
-                    candidate_limit=candidate_limit,
-                )
+                # The client warns (RuntimeWarning) when a returned entry's name does not match
+                # the one sent at that position, then carries on matching positionally. For a
+                # benchmark that is not a warning-level event, so the warning is captured and
+                # escalated. Safe to use catch_warnings here because chunks are mapped
+                # sequentially within this loop; it would not be safe under asyncio.gather.
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    last = await client.map_entities(
+                        chunk,
+                        entity_type=entity_type,
+                        annotation_mode=annotation_mode,
+                        annotators=annotators,
+                        vocab=vocab,
+                        prefer_canonical=prefer_canonical,
+                        prefer_human=prefer_human,
+                        candidate_limit=candidate_limit,
+                    )
+                self._assert_batch_order(caught, chunk)
+            except BatchOrderMismatchError:
+                raise  # never retried, never downgraded: the batch is unscorable
             except (BioMapperServerError, BioMapperRateLimitError) as exc:
                 # map_entities normally absorbs these; a raise here is from the client layer.
                 self._record_transport_error(exc)
@@ -406,6 +429,29 @@ class ApiMapper:
                 await asyncio.sleep(delay)
                 delay *= 2
         return last
+
+    @staticmethod
+    def _assert_batch_order(
+        caught: list[warnings.WarningMessage], chunk: list[dict[str, Any]]
+    ) -> None:
+        """Abort when the client reported a batch-order mismatch.
+
+        Raised rather than logged: see :class:`BatchOrderMismatchError`. The exception escapes
+        ``_map_chunk`` so the whole arm fails and the suite records it, instead of the affected
+        rows quietly becoming unresolved predictions that still get scored.
+        """
+        mismatches = [str(w.message) for w in caught if "Batch order mismatch" in str(w.message)]
+        if not mismatches:
+            return
+        raise BatchOrderMismatchError(
+            f"the API returned {len(mismatches)} of {len(chunk)} batch result(s) out of order, and "
+            f"the API returned {len(mismatches)} of {len(chunk)} batch result(s) out of order,"
+            f" and predictions are joined to the held-out gold BY POSITION — so scoring this"
+            f" batch would compare each prediction against another entity's gold. Refusing the"
+            f" arm. First mismatch: {mismatches[0]}"
+            f"compare each prediction against another entity's gold. Refusing the arm. "
+            f"First mismatch: {mismatches[0]}"
+        )
 
     def _record_transport_error(self, exc: Exception) -> None:
         if isinstance(exc, BioMapperRateLimitError):
@@ -463,6 +509,16 @@ class ApiMapper:
             for name in LIPID_FIELDS:
                 row[f"lipid_{name}"] = getattr(lipid, name, None) if lipid is not None else None
             prediction_rows.append(row)
+
+        order_errors = [
+            r.error for r in results if r.error and "Batch order mismatch" in r.error
+        ]
+        if order_errors:
+            raise BatchOrderMismatchError(
+                f"a batch-order mismatch reached result assembly ({len(order_errors)} row(s)); "
+                f"predictions are joined to the held-out gold by position, so this frame cannot be "
+                f"scored. First: {order_errors[0]}"
+            )
 
         predictions = pd.DataFrame(prediction_rows, index=out.index)
         # Refuse to silently shadow an input column: an adapter emitting its own
