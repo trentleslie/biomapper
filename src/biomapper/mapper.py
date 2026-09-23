@@ -37,6 +37,12 @@ def map_entities(
     annotators: list[str] | None = None,
     progress: bool = False,
     timeout: float = 30.0,
+    vocab: str | list[str] | None = None,
+    array_delimiters: list[str] | None = None,
+    prefer_human: bool | None = None,
+    prefer_canonical: bool | None = None,
+    candidate_limit: int | None = None,
+    kestrel_top_n: int | None = None,
 ) -> list[MappingResult]:
     """Map a list of entity records synchronously via the native ``/map/batch`` endpoint.
 
@@ -56,9 +62,20 @@ def map_entities(
                            that returns truly unresolved results for vendor codes.
         progress:          Show tqdm progress bar (requires ``biomapper[notebook]``).
         timeout:           Per-request timeout in seconds.
+        vocab:             Allowed vocabulary name(s) to map to, e.g. ``"refmet"``.
+        array_delimiters:  Characters used to split delimited ID strings.
+        prefer_human:      Prefer the human candidate for gene/protein entities.
+        prefer_canonical:  Prefer the canonical-namespace node for non-gene categories.
+        candidate_limit:   Candidates each Kestrel search annotator retrieves (1..100).
+        kestrel_top_n:     Opt in to raw Kestrel passthrough rows (1..100). Passthrough only.
+
+    Any option left as ``None`` is omitted from the request, so the server default applies.
 
     Returns:
         Ordered list of :class:`~biomapper.models.MappingResult`.
+
+    Raises:
+        ValueError: If ``candidate_limit`` or ``kestrel_top_n`` is outside 1..100.
     """
     client_kwargs: dict[str, Any] = {"timeout": timeout}
     if base_url is not None:
@@ -72,6 +89,12 @@ def map_entities(
                 annotation_mode=annotation_mode,
                 annotators=annotators,
                 progress=progress,
+                vocab=vocab,
+                array_delimiters=array_delimiters,
+                prefer_human=prefer_human,
+                prefer_canonical=prefer_canonical,
+                candidate_limit=candidate_limit,
+                kestrel_top_n=kestrel_top_n,
             )
 
     return asyncio.run(_run())
@@ -80,13 +103,19 @@ def map_entities(
 def map_entity(
     name: str,
     *,
-    identifiers: dict[str, str] | None = None,
+    identifiers: dict[str, str | list[str]] | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     entity_type: str = "biolink:SmallMolecule",
     annotation_mode: str = "missing",
     annotators: list[str] | None = None,
     timeout: float = 30.0,
+    vocab: str | list[str] | None = None,
+    array_delimiters: list[str] | None = None,
+    prefer_human: bool | None = None,
+    prefer_canonical: bool | None = None,
+    candidate_limit: int | None = None,
+    kestrel_top_n: int | None = None,
 ) -> MappingResult:
     """Map a single entity name synchronously.
 
@@ -101,9 +130,18 @@ def map_entity(
         annotation_mode: Annotation mode.
         annotators:      Optional list of annotator names to use.
         timeout:         Per-request timeout in seconds.
+        vocab:           Allowed vocabulary name(s) to map to.
+        array_delimiters: Characters used to split delimited ID strings.
+        prefer_human:    Prefer the human candidate for gene/protein entities.
+        prefer_canonical: Prefer the canonical-namespace node for non-gene categories.
+        candidate_limit: Candidates each Kestrel search annotator retrieves (1..100).
+        kestrel_top_n:   Opt in to raw Kestrel passthrough rows (1..100).
 
     Returns:
         :class:`~biomapper.models.MappingResult`
+
+    Raises:
+        ValueError: If ``candidate_limit`` or ``kestrel_top_n`` is outside 1..100.
     """
     results = map_entities(
         [{"name": name, "identifiers": identifiers or {}}],
@@ -113,6 +151,12 @@ def map_entity(
         annotation_mode=annotation_mode,
         annotators=annotators,
         timeout=timeout,
+        vocab=vocab,
+        array_delimiters=array_delimiters,
+        prefer_human=prefer_human,
+        prefer_canonical=prefer_canonical,
+        candidate_limit=candidate_limit,
+        kestrel_top_n=kestrel_top_n,
     )
     return results[0]
 
