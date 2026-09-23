@@ -1,0 +1,287 @@
+"""Drive every arm into ONE timestamped suite dir with ONE aggregate manifest.
+
+Ported from ``run.run_suite``. Three properties carried over deliberately:
+
+* **One bad arm never aborts the suite.** A failing arm is recorded ``status="failed"`` and the
+  run continues, so a suite always produces a complete account of what passed and what broke.
+* **Skips are recorded, never omitted.** A deliberate exclusion and an arm that fell out of the
+  registry by accident look identical if skips are simply dropped.
+* **The backend is pinned BEFORE any arm runs, and re-read after.** Sampling provenance at the
+  end would attribute every result to whatever build happened to be serving when the last arm
+  finished. Re-reading catches a build that moved mid-suite, which would mean the pins no longer
+  describe every number — silence there is the failure this exists to remove.
+
+The endpoint defaults to PRODUCTION. ``--endpoint`` switches to dev for future testing.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from biomapper.benchmarks.api_mapper import ApiMapper
+from biomapper.benchmarks.arms import ARM_RUNNERS
+from biomapper.benchmarks.config import SUITE_DATASETS, SUITE_SKIPPED
+from biomapper.benchmarks.provenance import (
+    DEFAULT_KESTREL_URL,
+    build_run_provenance,
+    circularity_notes,
+    fetch_kg_build_info,
+    new_run_id,
+    utc_stamp,
+)
+from biomapper.benchmarks.sources import SourceUnavailable
+
+# The deployment the paper describes. Production by default: a benchmark that measures a
+# dev checkout is not measuring the service a reader can call.
+PRODUCTION_ENDPOINT = "https://biomapper.expertintheloop.io/api/v1"
+DEV_ENDPOINT = "https://biomapper-dev.expertintheloop.io/api/v1"
+
+ENDPOINTS: dict[str, str] = {"production": PRODUCTION_ENDPOINT, "dev": DEV_ENDPOINT}
+
+DEFAULT_SUITE_ROOT = Path.home() / "external_benchmark_runs"
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_endpoint(endpoint: str) -> str:
+    """Map an alias (``production`` / ``dev``) to a URL, or pass a URL through.
+
+    A URL is accepted so a local or staging instance can be measured without editing this table,
+    but the aliases exist so the common case cannot be typo'd into pointing at the wrong backend.
+    """
+    if endpoint in ENDPOINTS:
+        return ENDPOINTS[endpoint]
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        return endpoint.rstrip("/")
+    raise ValueError(
+        f"unknown endpoint {endpoint!r}; use one of {sorted(ENDPOINTS)} or a full http(s) URL"
+    )
+
+
+def run_suite(
+    out_dir: Path | str | None = None,
+    *,
+    datasets: list[str] | None = None,
+    endpoint: str = "production",
+    api_key: str | None = None,
+    kestrel_url: str = DEFAULT_KESTREL_URL,
+    runners: dict[str, Any] | None = None,
+    probe_live: bool = True,
+    batch_size: int = 20,
+) -> dict[str, Any]:
+    """Run the suite and return ``{"out_dir", "manifest", "results"}``.
+
+    ``runners`` is injectable so the aggregation logic is testable offline without any network.
+    """
+    resolved_endpoint = resolve_endpoint(endpoint)
+    runners = ARM_RUNNERS if runners is None else runners
+    datasets = list(SUITE_DATASETS if datasets is None else datasets)
+
+    run_id = new_run_id("suite")
+    suite_dir = (
+        Path(out_dir) if out_dir is not None else DEFAULT_SUITE_ROOT / f"suite_{utc_stamp()}"
+    )
+    suite_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pin the backend BEFORE any arm runs.
+    provenance = build_run_provenance(
+        api_endpoint=resolved_endpoint,
+        kestrel_url=kestrel_url,
+        run_id=run_id,
+        probe_live=probe_live,
+    )
+    if probe_live and not provenance.pinned:
+        # Not fatal — the arms can still run — but a suite whose numbers cannot be attributed to a
+        # graph is worse than one with no pins, because "unknown" still looks like provenance.
+        logger.warning(
+            "Kestrel provenance is UNPINNED for this suite (%s). Every number will record "
+            "kestrel_version/kg_version as 'unknown'.",
+            provenance.health_error,
+        )
+
+    results: list[dict[str, Any]] = []
+    for key in datasets:
+        runner = runners.get(key)
+        if runner is None:
+            results.append({"dataset": key, "status": "skipped", "reason": "no runner registered"})
+            continue
+        mapper = ApiMapper(resolved_endpoint, api_key=api_key, batch_size=batch_size)
+        try:
+            record = runner(
+                mapper=mapper,
+                out_dir=suite_dir / key,
+                provenance=provenance,
+                kestrel_url=kestrel_url,
+            )
+            entry = {
+                "dataset": key,
+                "status": "ok",
+                "out_dir": record.get("out_dir", ""),
+                "role": record.get("role"),
+                "headline": _headline(record),
+            }
+            if record.get("arm_status") is not None:
+                # An arm with several sub-arms can complete one and fail another; without this the
+                # dataset-level status reads "ok" while a failure sits invisible on disk.
+                entry["arm_status"] = record["arm_status"]
+            entry["request_counters"] = mapper.counters.snapshot()
+            results.append(entry)
+        except SourceUnavailable as exc:
+            # The load-bearing distinction: unsourceable is a SKIP WITH A REASON, never an empty
+            # success and never a failure that reads as a bug in the harness.
+            results.append(
+                {
+                    "dataset": key,
+                    "status": "skipped",
+                    "reason": exc.reason,
+                    "request_counters": mapper.counters.snapshot(),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — a single failing arm must not abort the suite
+            logger.exception("Arm %s failed", key)
+            results.append(
+                {
+                    "dataset": key,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "request_counters": mapper.counters.snapshot(),
+                }
+            )
+
+    for key, reason in SUITE_SKIPPED.items():
+        if key not in datasets:
+            results.append({"dataset": key, "status": "skipped", "reason": reason})
+
+    kg = provenance.kg_build
+    manifest: dict[str, Any] = {
+        "run_id": run_id,
+        "suite_out_dir": str(suite_dir),
+        "created": utc_stamp(),
+        "pins": {
+            "api_endpoint": resolved_endpoint,
+            "endpoint_alias": endpoint if endpoint in ENDPOINTS else None,
+            "authenticated": bool(api_key),
+            "biomapper_version": provenance.biomapper_version,
+            "kestrel_url": kestrel_url,
+            "kestrel_version": provenance.kestrel_version,
+            "kg_version": kg.kg_version,
+            "kraken_package_version": kg.kraken_package_version,
+            "biolink_version": kg.biolink_version,
+            "kg_build_timestamp": kg.build_timestamp,
+            "kg_git_commit": kg.git_commit,
+            "kg_sources": list(kg.sources),
+            "source_versions": dict(kg.source_versions),
+            "provenance_pinned": provenance.pinned,
+            "provenance_error": provenance.health_error,
+        },
+        # Which arms may be quoted as accuracy and which are coverage, derived from the build's
+        # own ingested-source list rather than asserted from memory.
+        "circularity": circularity_notes(kg, datasets),
+        "datasets": results,
+        "n_ok": sum(1 for r in results if r["status"] == "ok"),
+        "n_failed": sum(1 for r in results if r["status"] == "failed"),
+        "n_skipped": sum(1 for r in results if r["status"] == "skipped"),
+    }
+
+    if probe_live:
+        # Re-read the build now the arms are done. If it moved, the pins above no longer describe
+        # every result and a reader must know that before treating the suite as one measurement.
+        end_version, end_kg, _ = fetch_kg_build_info(kestrel_url)
+        before = (provenance.kestrel_version, kg.kg_version, kg.git_commit)
+        after = (end_version, end_kg.kg_version, end_kg.git_commit)
+        manifest["kg_stable_during_run"] = before == after
+        if before != after:
+            manifest["kg_at_end"] = {
+                "kestrel_version": end_version,
+                "kg_version": end_kg.kg_version,
+                "kg_git_commit": end_kg.git_commit,
+            }
+
+    (suite_dir / "suite_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    (suite_dir / "README.md").write_text(_suite_readme(manifest))
+    return {"out_dir": str(suite_dir), "manifest": manifest, "results": results}
+
+
+def _headline(record: dict[str, Any]) -> dict[str, Any]:
+    """The arm's quotable numbers, extracted for the aggregate manifest.
+
+    Deliberately carries the role alongside the number. A coverage arm's figure and an accuracy
+    arm's figure are not comparable, and a manifest that lists them in one column without the
+    label invites exactly that comparison.
+    """
+    result = record.get("results") or {}
+    out: dict[str, Any] = {"role": record.get("role")}
+    core = result.get("comparable_core")
+    if isinstance(core, dict):
+        out["comparable_core"] = core
+    for extra in ("comparable_core_kg_equivalence_set", "comparable_core_charge_normalized"):
+        if isinstance(result.get(extra), dict):
+            out[extra] = result[extra]
+    if "per_namespace_accuracy" in result:
+        out["per_namespace_accuracy"] = result["per_namespace_accuracy"]
+        out["reportable_metric"] = "per_namespace_accuracy"
+    if "unambiguous_accuracy" in result:
+        out["unambiguous_accuracy"] = (result["unambiguous_accuracy"] or {}).get(
+            "per_namespace_accuracy"
+        )
+        out["ambiguous_flagrate"] = (result["ambiguous_flagrate"] or {}).get("comparable_core")
+    if "capability_gate" in result:
+        out["capability_gate"] = result["capability_gate"]
+    if "entries" in result:
+        out["entries"] = [
+            {"key": e.get("key"), "comparable_core": (e.get("result") or {}).get("comparable_core")}
+            for e in result["entries"]
+        ]
+    return out
+
+
+def _suite_readme(manifest: dict[str, Any]) -> str:
+    """A short human-readable index beside the machine-readable manifest.
+
+    Exists so the first thing a reader opens states the backend, the build, and which arms are
+    coverage rather than accuracy — the three things most often lost between a run and a write-up.
+    """
+    pins = manifest["pins"]
+    lines = [
+        "# External benchmark suite run",
+        "",
+        f"- Run id: `{manifest['run_id']}`",
+        f"- Created: {manifest['created']}",
+        f"- API endpoint: {pins['api_endpoint']}",
+        f"- Kestrel: {pins['kestrel_url']} (service {pins['kestrel_version']})",
+        f"- KG build: {pins['kg_version']} / biolink {pins['biolink_version']}"
+        f" / commit {pins['kg_git_commit']}",
+        f"- Provenance pinned: {pins['provenance_pinned']}",
+        f"- KG stable during run: {manifest.get('kg_stable_during_run', 'not probed')}",
+        "",
+        f"{manifest['n_ok']} ok, {manifest['n_failed']} failed, {manifest['n_skipped']} skipped.",
+        "",
+        "## Arms",
+        "",
+        "| arm | status | role | note |",
+        "|---|---|---|---|",
+    ]
+    for entry in manifest["datasets"]:
+        role = entry.get("role") or (manifest["circularity"].get(entry["dataset"], {}) or {}).get(
+            "label", ""
+        )
+        note = entry.get("reason") or entry.get("error") or ""
+        lines.append(f"| {entry['dataset']} | {entry['status']} | {role} | {note} |")
+    lines += [
+        "",
+        "## Reading these numbers",
+        "",
+        "- An arm labelled `coverage` measures whether an identifier was produced, not whether it",
+        "  was right. Its gold source is ingested into the graph being measured, so it must not be",
+        "  quoted as accuracy.",
+        "- Gene arms report accuracy PER TARGET NAMESPACE. The any-namespace roll-up is emitted",
+        "  flagged non-quotable.",
+        "- A `skipped` arm has a reason. It is not a zero and not a pass.",
+        "",
+        f"Generated {dt.datetime.now(dt.UTC).isoformat()}.",
+    ]
+    return "\n".join(lines) + "\n"

@@ -20,6 +20,9 @@ print(result.equivalent_ids_for("HMDB"))  # ['HMDB0000177']
 ```bash
 # Core (async HTTP client + Pydantic models)
 pip install biomapper
+
+# With the external benchmark suite
+pip install 'biomapper[benchmarks]'
 ```
 
 ---
@@ -344,6 +347,75 @@ Callback exceptions raised from `on_result` propagate unwrapped and
 **replace the return value** — partial results collected up to that point
 are lost. For UI consumers with failure-prone callbacks, wrap the callback
 body in your own try/except if you want partial data to survive.
+
+---
+
+## External benchmark suite
+
+An API-only reproduction harness for the benchmarks the BioMapper preprint reports. It runs
+against a **deployment**, not a local engine checkout, which matters for two reasons: running
+in-process against a checkout measures a library rather than the deployed service, and pointing at
+a deployment pins provenance to the backend that actually served the answers.
+
+```bash
+pip install 'biomapper[benchmarks]'
+
+python -m biomapper.benchmarks list                 # the 11 arms and the 2 deliberate skips
+python -m biomapper.benchmarks all                  # all arms, production endpoint
+python -m biomapper.benchmarks arm hajjar           # a single arm
+python -m biomapper.benchmarks --endpoint dev all   # dev, for testing
+```
+
+The public KRAKEN endpoint is keyless, and a BioMapper2 deployment with no keys configured is
+open, so the suite runs unauthenticated by default. Set `BIOMAPPER_API_KEY` if your deployment
+requires one; the key is never accepted on the command line, because argv is visible to other
+processes and lands in shell history.
+
+### The arms
+
+| Arm | Input | Metric | Reportable as |
+|---|---|---|---|
+| `hajjar` | metabolite name | InChIKey structure oracle, strict + KG-equivalence-set | accuracy candidate |
+| `necs` | metabolite name | structure oracle, strict + charge-normalized | accuracy, with the gold caveat |
+| `srm1950` | metabolite name | structure oracle (gold derived from certified SMILES) | accuracy candidate |
+| `metlinkr` | metabolite name | curator cross-link agreement + structural concordance | accuracy candidate |
+| `metabench` | mixed ID→ID and name→ID | CURIE equality over 1,000 grounding pairs | partly circular |
+| `metaboliteannotator` | metabolite name | name-hit rate, per ion mode | coverage by construction |
+| `refmet` | metabolite name | structure oracle | coverage |
+| `lmsd` | lipid name | shorthand resolvability, floor-gated | coverage (capability regression) |
+| `hgnc` | gene symbol | CURIE equality **per target namespace** | coverage |
+| `nlmgene` | gene mention | accuracy (unambiguous) + flag rate (ambiguous) | accuracy candidate |
+| `swisslipids` | lipid name | — | currently unsourceable, reports as skipped |
+
+**Read the `Reportable as` column before quoting anything.** Four of the graph's ingested sources
+(`lipidmaps`, `refmet`, `loinc`, `ncbigene`) are gold sources for arms above, so those arms measure
+coverage, not independent accuracy: the gold identifier and BioMapper's answer come from the same
+place. Each run labels every arm from the build's own source list rather than from a static note,
+so the label tracks the graph.
+
+Two further reporting rules the suite enforces rather than documents:
+
+- **Gene arms report accuracy per target namespace.** The any-namespace roll-up is emitted flagged
+  `quotable: false`, because the namespaces perform very differently and the roll-up has been
+  quoted as though it described all of them.
+- **A skipped arm is not a zero and not a pass.** It carries a reason into the manifest.
+
+### Provenance
+
+Every run records what actually served it, read from Kestrel `/health` (keyless) rather than
+hardcoded: `kestrel_version`, `kg_version`, `biolink_version`, `build_timestamp`, `git_commit`, the
+full `source_versions` map, the package version, each dataset's source SHA, and a run id. The build
+is read once before the arms start and re-read afterwards; if it moved mid-suite, the manifest says
+so, because the pins would no longer describe every number.
+
+Results are saved by default to a timestamped directory (override with `--out`). There is no flag
+that discards them: the expensive part of a run is live API traffic.
+
+### What stayed in the engine repo
+
+The CI regression gates (`gate.py`, `conflation_gate.py`, `test_regression_gate.py`,
+`kg-regression.yml`) guard merges and need engine internals. The `--resolver-mode {weighted,vote}`
+A/B toggles a resolver constructor argument that is deliberately not on the API surface.
 
 ---
 
