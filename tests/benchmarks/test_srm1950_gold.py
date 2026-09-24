@@ -142,6 +142,76 @@ def test_parsed_gold_sha_is_stable_and_order_independent(raw_df: pd.DataFrame) -
     assert first == second
 
 
+def test_parsed_gold_sha_is_order_independent_for_duplicate_names() -> None:
+    """Rows sharing a name must not make the digest depend on delivery order.
+
+    Greptile on PR #11: a name-only sort leaves same-name rows in file order, so reordering two
+    rows with the same name and different gold moved the SHA even though the gold set was
+    identical. Sorting by every hashed column fixes it.
+    """
+    a = (
+        b"HMDB_ID,NAME,SMILES,INCHIKEY,CHEMICAL_FORMULA,AVERAGE_MASS,MONO_MASS\n"
+        b"HMDB0000001,Same name,CCO,,,46.07,46.04\n"
+        b"HMDB0000002,Same name,CC(=O)O,,,60.05,60.02\n"
+    )
+    b = (
+        b"HMDB_ID,NAME,SMILES,INCHIKEY,CHEMICAL_FORMULA,AVERAGE_MASS,MONO_MASS\n"
+        b"HMDB0000001,Same name,CC(=O)O,,,60.05,60.02\n"
+        b"HMDB0000002,Same name,CCO,,,46.07,46.04\n"
+    )
+    assert parsed_gold_sha256(build_input_df(parse_csv(a), SRM1950), SRM1950) == parsed_gold_sha256(
+        build_input_df(parse_csv(b), SRM1950), SRM1950
+    )
+
+
+def test_parsed_gold_sha_covers_the_gold_smiles() -> None:
+    """A SMILES-only change must move the digest.
+
+    Greptile on PR #11: the charge-normalized variant neutralizes ``gold_smiles``, so when a
+    delivery supplies an explicit InChIKey the SMILES can still change a reported score. A digest
+    over name and InChIKey alone would not notice.
+    """
+    base = (
+        b"HMDB_ID,NAME,SMILES,INCHIKEY,CHEMICAL_FORMULA,AVERAGE_MASS,MONO_MASS\n"
+        b"HMDB0000001,Ethanol,CCO,LFQSCWFLJHTTHZ-UHFFFAOYSA-N,,46.07,46.04\n"
+        b"HMDB0000002,Acetic acid,CC(=O)O,QTBSBXVTEAMEQO-UHFFFAOYSA-N,,60.05,60.02\n"
+    )
+    # SMILES changes; the explicit InChIKey does not.
+    moved = base.replace(b"CCO,LFQSCWFLJHTTHZ", b"CCCO,LFQSCWFLJHTTHZ")
+    before = parsed_gold_sha256(build_input_df(parse_csv(base), SRM1950), SRM1950)
+    after = parsed_gold_sha256(build_input_df(parse_csv(moved), SRM1950), SRM1950)
+    assert before != after
+
+
+def test_sentinel_and_blank_hash_identically() -> None:
+    """Two spellings of "no structure" must not move the digest, because they score the same."""
+    blank = (
+        b"HMDB_ID,NAME,SMILES,INCHIKEY,CHEMICAL_FORMULA,AVERAGE_MASS,MONO_MASS\n"
+        b"HMDB0000001,Ethanol,CCO,,,46.07,46.04\n"
+        b"HMDB0000002,Missing,,,,0.0,0.0\n"
+    )
+    sentinel = blank.replace(b"HMDB0000002,Missing,,", b"HMDB0000002,Missing,#N/A,")
+    assert parsed_gold_sha256(
+        build_input_df(parse_csv(blank), SRM1950), SRM1950
+    ) == parsed_gold_sha256(build_input_df(parse_csv(sentinel), SRM1950), SRM1950)
+
+
+def test_coverage_does_not_count_sentinels_as_present(raw_df: pd.DataFrame) -> None:
+    """The card cannot report a row as covered and excluded at the same time.
+
+    Greptile on PR #11: reading the delivery literally leaves ``#N/A`` in ``gold_smiles``, and a
+    plain non-empty test counted it as coverage. On the real delivery that reported 1,007 SMILES
+    present while the exclusion block called 24 of them missing.
+    """
+    card = build_card(raw_df, "deadbeef", SRM1950)
+    ex = card["gold_structure_exclusions"]
+    # Three real SMILES (ethanol, acetic acid, benzene); one blank and one '#N/A' are not coverage.
+    assert card["coverage"]["SMILES"]["n"] == 3
+    # The card must be internally consistent: what it calls covered plus what it calls excluded
+    # accounts for every row exactly once.
+    assert card["coverage"]["SMILES"]["n"] + ex["n_excluded_total"] == card["n_rows"]
+
+
 def test_parsed_gold_sha_moves_when_the_gold_changes(raw_df: pd.DataFrame) -> None:
     """It must actually be sensitive to the thing it claims to pin."""
     before = parsed_gold_sha256(build_input_df(raw_df, SRM1950), SRM1950)

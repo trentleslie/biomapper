@@ -297,15 +297,31 @@ def build_input_df(raw_df: pd.DataFrame, config: DatasetConfig = SRM1950) -> pd.
 
 
 def parsed_gold_sha256(input_df: pd.DataFrame, config: DatasetConfig = SRM1950) -> str:
-    """SHA of the parsed gold structures, so the scored subset is reproducible.
+    """SHA of the parsed gold values, so the scored subset is reproducible.
 
-    Hashes the name plus the derived gold InChIKey, sorted by name and serialized without an index,
-    so the digest depends on the gold content and not on row order or pandas formatting defaults.
+    Hashes every gold input that scoring reads: the name, the derived gold InChIKey, and the gold
+    SMILES. The SMILES is not redundant. When a delivery supplies an explicit InChIKey the SMILES
+    no longer determines it, but the charge-normalized variant still neutralizes the SMILES, so a
+    SMILES-only change would move a reported score while leaving a name-plus-InChIKey digest
+    untouched.
+
+    Sorted by ALL hashed columns, not by name alone: two retained rows can share a name and differ
+    in gold, and a name-only sort leaves those ties in delivery order, which makes the digest move
+    when rows are merely reordered.
+
     Separate from the delivery SHA: the delivery pins what arrived, this pins what was scored, and
     an RDKit or adapter change moves this one while leaving the delivery digest untouched.
     """
     columns = [config.name_column, config.gold_inchikey_column]
-    frame = input_df[columns].sort_values(config.name_column, kind="stable")
+    if config.gold_smiles_column:
+        columns.append(config.gold_smiles_column)
+    frame = input_df[columns].copy()
+    # Normalize missing markers to blank before hashing, so a delivery that switches between an
+    # empty cell and an '#N/A' sentinel for the same absent structure does not move the digest.
+    # The digest describes the gold that was scored, and both spellings score identically.
+    for column in columns[1:]:
+        frame[column] = frame[column].map(lambda v: "" if is_missing(v) else _norm(v))
+    frame = frame.sort_values(columns, kind="stable")
     return hashlib.sha256(frame.to_csv(index=False).encode()).hexdigest()
 
 
@@ -319,7 +335,11 @@ def build_card(
     n = len(input_df)
     coverage: dict[str, dict[str, Any]] = {}
     for namespace, column in config.gold_coverage_columns:
-        present = int((input_df.get(column, pd.Series([""] * n)).map(_norm) != "").sum())
+        # A missing-data sentinel is NOT coverage. Reading the delivery literally keeps '#N/A' in
+        # the SMILES column, so a plain non-empty test would report those 24 rows as covered while
+        # the exclusion report next to it calls them missing. One card cannot say both.
+        values = input_df.get(column, pd.Series([""] * n))
+        present = int(sum(0 if is_missing(v) else 1 for v in values))
         coverage[namespace] = {"n": present, "fraction": (present / n) if n else 0.0}
     return {
         "dataset": config.key,
