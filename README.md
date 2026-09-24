@@ -511,6 +511,10 @@ make test           # tests only
 make coverage       # HTML coverage report
 ```
 
+`docs/solutions/` holds documented solutions to past problems — bugs, best practices, and workflow
+patterns — organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant
+when implementing or debugging in an area something has already been written about.
+
 ---
 
 ## License
