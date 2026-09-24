@@ -343,3 +343,43 @@ def test_a_confirmed_hydrogen_gap_is_still_called_an_artifact():
     )
     assert outcome == "charge_or_protonation_artifact"
     assert "mass gap matches" in rationale
+
+
+def test_the_resolver_throttles_misses_and_not_cache_hits(monkeypatch):
+    # PubChem asks for at most 5 requests per second. The certification path learned this the
+    # expensive way; this module fires up to two lookups per case, so it needs the same rule.
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+    class _Resp:
+        status_code = 200
+        text = (
+            '{"PropertyTable": {"Properties": [{"InChIKey": "WQZGKKKJIJFFOK-GASJEMHNSA-N",'
+            ' "MolecularFormula": "C6H12O6", "MonoisotopicMass": "180.06"}]}}'
+        )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, _url: str, timeout: float = 0) -> _Resp:
+            self.calls += 1
+            return _Resp()
+
+    session = _Session()
+    resolver = OutsideResolver(session=session, min_interval_s=0.25)
+    resolver.by_name("glucose")
+    resolver.by_name("glucose")  # cache hit: no request, no sleep
+    resolver.by_name("urea")
+    assert session.calls == 2
+    # The first request has no predecessor to space from, so only the second sleeps.
+    assert len(sleeps) == 1 and sleeps[0] <= 0.25
+
+
+def test_throttling_can_be_disabled_for_tests():
+    class _Session:
+        def get(self, _url: str, timeout: float = 0):  # noqa: ANN202
+            raise AssertionError("should not be called")
+
+    resolver = OutsideResolver(session=_Session(), min_interval_s=0)
+    assert resolver._min_interval_s == 0

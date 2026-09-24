@@ -215,21 +215,40 @@ def suspected_derivative(left: OutsideRecord, right: OutsideRecord) -> bool:
     )
 
 
+# PubChem PUG-REST asks for no more than 5 requests per second. The certification path learned this
+# the expensive way: ~592 unspaced lookups returned 109 `lookup_failed`, which became 169 refusals
+# that were run artifacts rather than absent structures. The same throttle has to live here, because
+# this module fires up to two lookups per non-certified case. Duplicating the rule in two modules is
+# how one copy gets the fix and its sibling does not, so the constant is named in both and this
+# comment points at the other.
+PUBCHEM_MIN_INTERVAL_S = 0.25
+
+
 class OutsideResolver:
     """PubChem name-index lookups returning block, formula and mass together.
 
     A different lookup than either side of the certificate used, which is the whole point: the NECS
     side came from the curated supplement key and the cohort side from a vendor identifier, so the
     name index is independent of both. Cached, IPv4-forced (the desktop IPv6 route to some CDNs is
-    broken), and fail-soft.
+    broken), throttled, and fail-soft.
+
+    A cache hit does NOT sleep, so re-adjudicating a repeated name costs nothing.
     """
 
-    def __init__(self, *, timeout: float = 20.0, session: Any | None = None) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        *,
+        timeout: float = 20.0,
+        session: Any | None = None,  # noqa: ANN401
+        min_interval_s: float = PUBCHEM_MIN_INTERVAL_S,
+    ) -> None:
         import requests
 
         self._timeout = timeout
         self._session = session or requests.Session()
         self._cache: dict[str, OutsideRecord] = {}
+        self._min_interval_s = min_interval_s
+        self._last_request_at = 0.0
 
     def by_name(self, name: str) -> OutsideRecord:
         return self._resolve(f"name:{name}", f"compound/name/{quote(name, safe='')}")
@@ -243,6 +262,7 @@ class OutsideResolver:
         # bank a refusal the service would not have given a minute later.
         if cached is not None and cached.status != "lookup_failed":
             return cached
+        self._throttle()
         url = f"{_PUG_REST}/{path}/property/{PROPERTIES}/JSON"
         try:
             with force_ipv4():
@@ -259,6 +279,17 @@ class OutsideResolver:
             record = self._parse(response.text)
         self._cache[cache_key] = record
         return record
+
+    def _throttle(self) -> None:
+        """Space outgoing requests. Called only on a cache miss, just before the request."""
+        import time
+
+        if self._min_interval_s <= 0:
+            return
+        elapsed = time.monotonic() - self._last_request_at
+        if elapsed < self._min_interval_s:
+            time.sleep(self._min_interval_s - elapsed)
+        self._last_request_at = time.monotonic()
 
     @staticmethod
     def _parse(body: str) -> OutsideRecord:
@@ -454,6 +485,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--cohort", default="arivale")
     parser.add_argument(
+        "--min-interval-s",
+        type=float,
+        default=PUBCHEM_MIN_INTERVAL_S,
+        help="Seconds between PubChem requests. PUG-REST asks for at most 5 per second; unspaced "
+        "runs return lookup_failed, which becomes a refusal that is a run artifact.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -476,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         cases = cases.loc[cases.index.isin(keep) | (cases["verdict"] == "certified")]
         print(f"[warn] limited to {args.limit} adjudicable cases; coverage is partial", flush=True)
 
-    resolved = readjudicate(cases, OutsideResolver())
+    resolved = readjudicate(cases, OutsideResolver(min_interval_s=args.min_interval_s))
     out = args.run_dir / f"readjudication_{args.cohort}.csv"
     resolved.to_csv(out, index=False)
     tally = dict(Counter(resolved["readjudication"].tolist()))
@@ -486,6 +524,10 @@ def main(argv: list[str] | None = None) -> int:
         "outcomes": tally,
         "limit_applied": args.limit or None,
         "mass_tolerance_da": MASS_TOLERANCE_DA,
+        "min_interval_s": args.min_interval_s,
+        "unresolved_outside_count": int(
+            (resolved["readjudication"] == "outside_source_unresolved").sum()
+        ),
         "outside_source": (
             "PubChem PUG-REST name index (InChIKey, MolecularFormula, MonoisotopicMass)"
         ),
