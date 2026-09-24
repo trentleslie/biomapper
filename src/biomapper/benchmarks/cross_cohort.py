@@ -790,9 +790,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     refmet_map = load_refmet_map(args.refmet_cache)
-    results = run_links(
-        panels, curies, refmet_map, out_dir, errored, provenance.kg_build.sources
-    )
+    results = run_links(panels, curies, refmet_map, out_dir, errored, provenance.kg_build.sources)
 
     manifest = {
         "arm": "M (BioMapper, names only) vs B (Monti method, re-derived) vs Monti published",
