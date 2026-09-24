@@ -91,6 +91,28 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from `genuine_structural_disagreement` from `outside_source_unresolved`, so a refusal that could
   not be checked is never folded into one that was.
 
+### Fixed (review round 3, from the first live panel)
+
+- **The client commit is captured at run start, not at sidecar write.** The first live panel exposed
+  this: a sidecar is written when its panel finishes, 29 minutes after launch here, and the working
+  tree was being read at that moment. The sidecar therefore named a commit that was not the code the
+  process had loaded. A provenance record naming the wrong code is worse than one naming none,
+  because it looks authoritative. The late-capture path remains as a fallback but labels itself.
+- **An identical molecular formula is no longer called a tautomer artifact.** `composition_relation`
+  replaces a boolean that treated same-formula-different-first-block as an artifact. It is not
+  decidable that way: Pro-Leu against Leu-Pro, and leucine against isoleucine, share a formula and a
+  mass while being genuinely different molecules, and keto-enol tautomers also share a hydrogen
+  count. Since the first block IS the connectivity hash, that case is equally a tautomer and a
+  constitutional isomer. Only a hydrogen-count difference confirmed by the mass gap is now called
+  `charge_or_protonation_artifact`; the ambiguous case becomes
+  `same_formula_different_connectivity` and says it must not be counted in either direction.
+- **`outside_source_hit_a_derivative` is a named outcome.** Observed live: production resolved the
+  LLFS row "Prolylleucine" to `RM:0137550` (block `ZKQOUHVVXABNDG`, CID 3527720, C11H20N2O3, the free
+  Pro-Leu dipeptide) and the API certificate marked it `contradicted` because its own external
+  fallback returned `YCYXUKRYYSXSLJ` (CID 3584406, Cbz-protected Z-Pro-Leu, C19H26N2O5). BioMapper
+  was right and the certificate's independent source was wrong, because PubChem's name index ranks
+  protected forms above free peptides. Detected by a containing formula plus a mass gap over 50 Da.
+
 ### Notes
 
 - Cohorts that ship names only (NECS, Xu, LLFS, BLSA have no vendor identifier column) are
