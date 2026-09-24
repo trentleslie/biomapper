@@ -745,6 +745,33 @@ def prepare_panel(
     else:
         pin = {"panel": label, "status": "match", "drift": None}
     frame = resolve_panel(mapper, panel, out_dir, label, provenance, client_repo)
+
+    # Repair is SKIPPED for a checkpoint whose backend was not confirmed. Under
+    # --allow-unpinned-checkpoints the drift check returns a status instead of raising, and a
+    # repair would remap the failed rows against the CURRENT backend while keeping inherited rows
+    # from an unknown or different one. That yields a genuinely per-row mixed file whose overlap
+    # would still read as one coherent backend's output, since the manifest carries only the pin
+    # status and aggregate repair counts. Leaving it unrepaired keeps the file homogeneous and the
+    # errors reported as unrecovered, which is the honest shape.
+    if pin["status"] != "match":
+        repair: dict[str, Any] = {
+            "attempted": 0,
+            "recovered": 0,
+            "still_errored": len(errored_names(frame)),
+            "skipped": True,
+            "skipped_reason": (
+                f"checkpoint provenance is {pin['status']}, so a repair would mix rows from the "
+                "current backend into a checkpoint produced by an unconfirmed one"
+            ),
+        }
+        if repair["still_errored"]:
+            print(
+                f"[warn] {label}: repair skipped ({pin['status']} provenance); "
+                f"{repair['still_errored']} errored rows left as found",
+                flush=True,
+            )
+        return frame, pin, repair
+
     frame, repair = repair_errored_rows(mapper, frame, out_dir, label)
     return frame, pin, repair
 
@@ -892,6 +919,7 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    skipped_repairs = {k: v["skipped_reason"] for k, v in repairs.items() if v.get("skipped")}
     unpinned = {k: v["status"] for k, v in pins.items() if v["status"] != "match"}
     if unpinned:
         print(
@@ -992,6 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "mapping_errors": {
             "repair_pass": repairs,
+            "repairs_skipped_for_unconfirmed_provenance": skipped_repairs,
             "unrecovered_by_panel": unrecovered,
             "note": (
                 "An errored row is a row the deployment never answered. It is counted apart "

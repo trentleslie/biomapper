@@ -939,3 +939,50 @@ def test_without_refresh_an_existing_checkpoint_is_reused(tmp_path):
     frame = resolve_panel(mapper, _panel(names, "necs"), tmp_path, "necs")
     assert mapper.requested == []
     assert frame["chosen_kg_id"].tolist() == ["CHEBI:1"]
+
+
+def test_repair_is_skipped_for_an_allowed_but_unconfirmed_checkpoint(tmp_path):
+    # Under --allow-unpinned-checkpoints the drift check reports instead of raising. Repairing then
+    # would remap failed rows against the CURRENT backend while keeping inherited rows from another,
+    # producing a per-row mixed file whose overlap would still read as one backend's output.
+    names = ["glucose", "urea"]
+    _checkpoint(tmp_path, "necs", names, error_on="urea")
+    before = (tmp_path / "necs_MAPPED.tsv").read_bytes()
+    write_panel_provenance(tmp_path, "necs", _provenance(kg_version="2.1.0"), {"commit": "a" * 40})
+    mapper = _StubMapper({"urea": {"chosen_kg_id": "CHEBI:16199", "kg_equivalent_ids": "{}"}})
+
+    frame, pin, repair = prepare_panel(
+        mapper,
+        _panel(names, "necs"),
+        tmp_path,
+        "necs",
+        _provenance(kg_version="2.1.1"),
+        {"commit": "a" * 40},
+        allow_unpinned=True,
+    )
+    assert pin["status"] == "drift"
+    assert repair["skipped"] is True and repair["attempted"] == 0
+    assert repair["still_errored"] == 1  # reported as unrecovered, not quietly fixed
+    assert "unconfirmed one" in repair["skipped_reason"]
+    assert mapper.requested == []
+    assert (tmp_path / "necs_MAPPED.tsv").read_bytes() == before
+    assert errored_names(frame) == ["urea"]
+
+
+def test_repair_still_runs_for_a_confirmed_checkpoint(tmp_path):
+    names = ["glucose", "urea"]
+    _checkpoint(tmp_path, "necs", names, error_on="urea")
+    provenance = _provenance()
+    write_panel_provenance(tmp_path, "necs", provenance, {"commit": "a" * 40})
+    mapper = _StubMapper({"urea": {"chosen_kg_id": "CHEBI:16199", "kg_equivalent_ids": "{}"}})
+    _frame, pin, repair = prepare_panel(
+        mapper,
+        _panel(names, "necs"),
+        tmp_path,
+        "necs",
+        provenance,
+        {"commit": "a" * 40},
+        allow_unpinned=True,
+    )
+    assert pin["status"] == "match"
+    assert repair.get("skipped") is None and repair["recovered"] == 1
