@@ -64,6 +64,33 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that still errors is reported in the manifest with the affected panel's counts labelled a floor.
   The deployment did return 5xx under concurrent load during this work, so this is a live hazard.
 
+### Fixed (review round 2)
+
+- **Checkpoints now carry the backend that answered them.** Panels resolve as separate processes and
+  are combined by `--link-only`, which previously fetched `/health` once at finalization and stamped
+  it on every checkpoint. A deployment or graph-build change between panel runs would then present a
+  mixed-backend result as one pinned run. Each panel writes a provenance sidecar at resolve time, and
+  finalization compares `endpoint`, `kestrel_version`, `kg_version`, `biolink_version`,
+  `build_timestamp` and `git_commit` per panel. A mismatch, or a checkpoint with no sidecar at all,
+  raises `BackendDriftError`. `--allow-unpinned-checkpoints` is an explicit escape that records the
+  gap in the manifest instead of letting the run read as pinned.
+- **A missing per-pair link artifact no longer reads as zero links.** `manifest.json` existing does
+  not imply the artifacts do. `read_links` raises `MissingLinkArtifactError`, and each link file's
+  row count is cross-checked against the manifest's `arm_m_links`.
+- **A transient PubChem failure is no longer overwritten by a clean fallback miss.** A `lookup_failed`
+  on the CID route followed by a `clean_miss` on the HMDB route previously reported a retryable run
+  artifact as a genuine coverage gap. The failure is sticky unless a fallback actually resolves.
+
+### Added (review round 2)
+
+- **`biomapper.benchmarks.cross_cohort_readjudicate`.** Every non-certified case is checked against
+  PubChem's name index, which is a different lookup than either side of the certificate used. A
+  first-block mismatch is classified as a tautomer, charge or salt artifact only when the outside
+  source corroborates BOTH sides and their heavy-atom compositions match with a mass gap consistent
+  with the hydrogen-count difference. Outcomes separate `necs_gold_suspect` from `cohort_id_suspect`
+  from `genuine_structural_disagreement` from `outside_source_unresolved`, so a refusal that could
+  not be checked is never folded into one that was.
+
 ### Notes
 
 - Cohorts that ship names only (NECS, Xu, LLFS, BLSA have no vendor identifier column) are
