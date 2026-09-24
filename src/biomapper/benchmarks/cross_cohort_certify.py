@@ -155,16 +155,24 @@ def arivale_independent_blocks(
         block: str | None = None
         source = "none"
         status = "clean_miss"
+        # A transient failure on the first route is STICKY across the fallback. Letting a later
+        # clean_miss overwrite an earlier lookup_failed would turn a retryable run artifact into a
+        # reported coverage gap, and the refusal classifier would then call it a real absence.
+        any_transient_failure = False
         if cid:
             block, status = resolver._cached_resolve(  # noqa: SLF001 - status-aware accessor
                 f"pubchem:{cid}", f"compound/cid/{cid}/property/InChIKey/TXT"
             )
             source = "provided-pubchem"
+            any_transient_failure = status == "lookup_failed"
         if block is None and hmdb:
             block, status = resolver._cached_resolve(  # noqa: SLF001
                 f"hmdb:{hmdb}", f"compound/xref/RegistryID/{hmdb}/property/InChIKey/TXT"
             )
             source = "provided-hmdb"
+            any_transient_failure = any_transient_failure or status == "lookup_failed"
+        if block is None and any_transient_failure:
+            status = "lookup_failed"
         if not cid and not hmdb:
             source = "none"
             status = "no_structure_resolvable_id"
@@ -193,7 +201,21 @@ def arivale_independent_blocks(
     return blocks, card
 
 
+class MissingLinkArtifactError(RuntimeError):
+    """A cohort's link file is absent or disagrees with the manifest.
+
+    ``manifest.json`` existing does not mean every per-pair artifact does. A partially copied or
+    truncated run directory would otherwise yield a successful certificate report claiming zero
+    links, which is indistinguishable from a genuine zero and reads as a finding.
+    """
+
+
 def read_links(path: Path, cohort: str) -> list[Link]:
+    if not path.exists():
+        raise MissingLinkArtifactError(
+            f"{path} is missing. A cohort with no link file is an incomplete run directory, not a "
+            "cohort with zero links; refusing to report a certificate over it."
+        )
     frame = pd.read_csv(path, dtype=str).fillna("")
     column = f"{cohort}_name"
     if frame.empty:
@@ -314,9 +336,24 @@ def main(argv: list[str] | None = None) -> int:
         "cohorts": {},
     }
 
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    manifest_links = {
+        cohort: int(result.get("arm_m_links", -1))
+        for cohort, result in (manifest.get("results") or {}).items()
+    }
+
     for cohort in COHORTS:
         links_path = run_dir / f"links_necs_{cohort}.csv"
-        links = read_links(links_path, cohort) if links_path.exists() else []
+        links = read_links(links_path, cohort)
+        expected_links = manifest_links.get(cohort, -1)
+        if expected_links >= 0 and len(links) != expected_links:
+            print(
+                f"[fatal] {links_path.name} holds {len(links)} links but the manifest recorded "
+                f"{expected_links} for this pair. Refusing to certify over an artifact that does "
+                "not match the run that produced it.",
+                file=sys.stderr,
+            )
+            return 2
         if cohort not in CERTIFIABLE_COHORTS:
             report["cohorts"][cohort] = {
                 "certifiable": False,

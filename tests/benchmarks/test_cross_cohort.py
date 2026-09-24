@@ -21,18 +21,24 @@ import pytest
 from biomapper.benchmarks.adapters.cohort_panel import (
     ARIVALE,
     BLSA,
+    CohortPanel,
     CohortPanelConfig,
     load_cohort_panel,
 )
 from biomapper.benchmarks.cross_cohort import (
+    BackendDriftError,
     PanelAlignmentError,
     assert_alignment,
+    check_panel_provenance,
     client_repo_provenance,
     cross_check_harmonize,
     curies_by_name,
     errored_names,
     repair_errored_rows,
+    run_links,
+    write_panel_provenance,
 )
+from biomapper.benchmarks.provenance import KgBuildInfo, RunProvenance
 from biomapper.benchmarks.scorers.arm_b_baseline import (
     MONTI_PUBLISHED,
     MONTI_PUBLISHED_PROVENANCE,
@@ -611,3 +617,143 @@ def test_client_repo_provenance_names_the_code_that_ran():
     assert set(record) == {"repo", "commit", "dirty"}
     # A wheel install has no repository; that is reported as None rather than invented.
     assert record["commit"] is None or len(str(record["commit"])) == 40
+
+
+# ==================================================================================================
+# Checkpoint provenance: panels resolved separately must be attributable to one backend
+# ==================================================================================================
+
+
+def _provenance(
+    *, endpoint: str = "https://api.invalid/v1", kg_version: str = "2.1.1", commit: str = "a" * 40
+) -> RunProvenance:
+    return RunProvenance(
+        run_id="test",
+        biomapper_version="1.5.0",
+        api_endpoint=endpoint,
+        kestrel_url="https://kestrel.invalid/api",
+        kestrel_version="0.3.0",
+        run_timestamp="2026-09-24T00:00:00+00:00",
+        kg_build=KgBuildInfo(
+            kg_version=kg_version,
+            biolink_version="4.2.5",
+            build_timestamp="2026-09-17T07:27:41Z",
+            git_commit=commit,
+        ),
+    )
+
+
+def test_panel_provenance_round_trips_and_matches(tmp_path):
+    provenance = _provenance()
+    write_panel_provenance(tmp_path, "necs", provenance)
+    status = check_panel_provenance(tmp_path, "necs", provenance, allow_unpinned=False)
+    assert status["status"] == "match" and status["drift"] is None
+
+
+def test_a_different_graph_build_between_panels_aborts():
+    # This is the failure the sidecar exists for: two panels answered by different builds, then
+    # intersected and stamped with one provenance block.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        out = Path(directory)
+        write_panel_provenance(out, "necs", _provenance(kg_version="2.1.0"))
+        with pytest.raises(BackendDriftError) as caught:
+            check_panel_provenance(
+                out, "necs", _provenance(kg_version="2.1.1"), allow_unpinned=False
+            )
+        assert "kg_version" in str(caught.value)
+
+
+def test_a_different_endpoint_between_panels_aborts(tmp_path):
+    write_panel_provenance(tmp_path, "necs", _provenance(endpoint="https://other.invalid/v1"))
+    with pytest.raises(BackendDriftError):
+        check_panel_provenance(tmp_path, "necs", _provenance(), allow_unpinned=False)
+
+
+def test_a_checkpoint_with_no_sidecar_is_refused_not_assumed(tmp_path):
+    # Worse than a mismatch, because an unpinned checkpoint looks fine.
+    with pytest.raises(BackendDriftError) as caught:
+        check_panel_provenance(tmp_path, "necs", _provenance(), allow_unpinned=False)
+    assert "no sidecar" in str(caught.value)
+
+
+def test_drift_can_be_published_but_only_on_the_record(tmp_path):
+    write_panel_provenance(tmp_path, "necs", _provenance(kg_version="2.1.0"))
+    status = check_panel_provenance(tmp_path, "necs", _provenance(), allow_unpinned=True)
+    assert status["status"] == "drift"
+    assert status["drift"]["kg_version"] == {"panel": "2.1.0", "finalizing_run": "2.1.1"}
+
+
+# ==================================================================================================
+# run_links: an unrecovered error must not be double-counted as a non-resolution
+# ==================================================================================================
+
+
+def _panel(names: list[str], key: str, certifiable: bool = False) -> CohortPanel:
+    config = CohortPanelConfig(key=key, name_column="name")
+    return load_cohort_panel(pd.DataFrame({"name": names}), config)
+
+
+def _link_fixture() -> tuple[dict[str, CohortPanel], dict[str, dict[str, frozenset[str]]]]:
+    panels = {
+        "necs": _panel(["glucose", "urea", "dropped_by_server"], "necs"),
+        "arivale": _panel(["glucose", "creatinine"], "arivale"),
+        "xuetal": _panel(["glucose"], "xuetal"),
+        "llfs": _panel(["glucose"], "llfs"),
+        "blsa": _panel(["glucose"], "blsa"),
+    }
+    linked = frozenset({"CHEBI:17234"})
+    curies = {
+        "necs": {"glucose": linked, "urea": frozenset(), "dropped_by_server": frozenset()},
+        "arivale": {"glucose": linked, "creatinine": frozenset()},
+        "xuetal": {"glucose": linked},
+        "llfs": {"glucose": linked},
+        "blsa": {"glucose": linked},
+    }
+    return panels, curies
+
+
+def test_run_links_excludes_errored_rows_from_unresolved(tmp_path):
+    panels, curies = _link_fixture()
+    results = run_links(
+        panels,
+        curies,
+        {"glucose": "Glucose"},
+        tmp_path,
+        errored={"necs": {"dropped_by_server"}},
+    )
+    arivale = results["arivale"]
+    # "urea" genuinely did not resolve. "dropped_by_server" was never answered. Only the first is
+    # an unresolved metabolite; counting both would report the deployment failure twice.
+    assert arivale["necs_unresolved"] == 1
+    assert arivale["necs_errored"] == 1
+    assert arivale["necs_comparable"] == 1
+    listed = pd.read_csv(tmp_path / "unresolved_necs.csv")["name"].tolist()
+    assert listed == ["urea"]
+    assert pd.read_csv(tmp_path / "errored_necs.csv")["name"].tolist() == ["dropped_by_server"]
+
+
+def test_run_links_without_an_error_map_counts_every_empty_row_as_unresolved(tmp_path):
+    panels, curies = _link_fixture()
+    results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
+    assert results["arivale"]["necs_unresolved"] == 2
+    assert results["arivale"]["necs_errored"] == 0
+
+
+def test_run_links_carries_the_published_provenance_and_the_superseded_value(tmp_path):
+    panels, curies = _link_fixture()
+    results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
+    assert results["blsa"]["monti_published"] == 188
+    assert results["blsa"]["monti_published_superseded_value"] == 99
+    assert results["blsa"]["monti_published_provenance"]["conflict"]["alternate"] == 99
+    # Names-only cohorts say so in the result, so a table cannot render a blank as a failure.
+    assert results["blsa"]["certifiable"] is False
+    assert "never structurally certifiable" in results["blsa"]["certifiability_note"]
+
+
+def test_run_links_asserts_the_two_linkers_agree(tmp_path):
+    panels, curies = _link_fixture()
+    results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
+    for cohort in ("arivale", "xuetal", "llfs", "blsa"):
+        assert results[cohort]["harmonize_cross_check"]["agree"] is True

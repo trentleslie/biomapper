@@ -58,6 +58,7 @@ from biomapper.benchmarks.adapters.cohort_panel import (
 from biomapper.benchmarks.api_mapper import ApiMapper
 from biomapper.benchmarks.provenance import (
     DEFAULT_KESTREL_URL,
+    RunProvenance,
     build_run_provenance,
     utc_stamp,
 )
@@ -110,6 +111,15 @@ REQUEST = {
     "annotation_mode": "all",
     "provided_id_columns": [],
 }
+
+
+class BackendDriftError(RuntimeError):
+    """Panels were answered by different backends, so they must not be intersected.
+
+    A cross-cohort overlap is only meaningful when both sides resolved through the same graph. Two
+    checkpoints from different builds produce a number no single backend ever produced, and stamping
+    one provenance block on them would present it as pinned.
+    """
 
 
 class PanelAlignmentError(RuntimeError):
@@ -173,8 +183,107 @@ def load_panels(spreadsheet: Path, arivale_xlsx: Path) -> dict[str, CohortPanel]
     return panels
 
 
-def resolve_panel(mapper: ApiMapper, panel: CohortPanel, out_dir: Path, label: str) -> pd.DataFrame:
-    """Resolve one panel name-only; checkpoint the mapped TSV so a mid-run 5xx loses nothing."""
+# Provenance fields a checkpoint and the finalizing run must agree on. A change in any of them means
+# two panels were answered by different software or a different graph, so intersecting them would
+# report a cross-cohort overlap that no single backend ever produced.
+PINNED_FIELDS: tuple[str, ...] = (
+    "endpoint",
+    "kestrel_version",
+    "kg_version",
+    "biolink_version",
+    "build_timestamp",
+    "git_commit",
+)
+
+
+def panel_provenance_path(out_dir: Path, label: str) -> Path:
+    return out_dir / f"{label}_provenance.json"
+
+
+def write_panel_provenance(out_dir: Path, label: str, provenance: RunProvenance) -> dict[str, Any]:
+    """Record which backend answered THIS panel, next to its checkpoint.
+
+    Panels are resolved as separate processes and combined later, so a single provenance probe taken
+    at link time would stamp one graph build onto checkpoints that may have been produced by
+    another. Each panel therefore carries its own pin, and :func:`check_panel_provenance` refuses to
+    combine checkpoints that disagree.
+    """
+    record = {
+        "panel": label,
+        "endpoint": provenance.api_endpoint,
+        "kestrel_url": provenance.kestrel_url,
+        "kestrel_version": provenance.kestrel_version,
+        "kg_version": provenance.kg_build.kg_version,
+        "biolink_version": provenance.kg_build.biolink_version,
+        "build_timestamp": provenance.kg_build.build_timestamp,
+        "git_commit": provenance.kg_build.git_commit,
+        "source_versions": provenance.kg_build.source_versions,
+        "resolved_at": provenance.run_timestamp,
+        "biomapper_version": provenance.biomapper_version,
+        "client_repo": client_repo_provenance(),
+    }
+    panel_provenance_path(out_dir, label).write_text(json.dumps(record, indent=2, default=str))
+    return record
+
+
+def check_panel_provenance(
+    out_dir: Path, label: str, final: RunProvenance, *, allow_unpinned: bool
+) -> dict[str, Any]:
+    """Compare a panel's recorded backend against the finalizing probe.
+
+    Returns a status record. A missing sidecar means the checkpoint predates provenance recording
+    and cannot be attributed to a build at all, which is worse than a mismatch because it looks
+    fine. Both are refused unless ``allow_unpinned`` is set, and in that case the manifest carries
+    the fact rather than the run pretending to be pinned.
+    """
+    path = panel_provenance_path(out_dir, label)
+    expected = {
+        "endpoint": final.api_endpoint,
+        "kestrel_version": final.kestrel_version,
+        "kg_version": final.kg_build.kg_version,
+        "biolink_version": final.kg_build.biolink_version,
+        "build_timestamp": final.kg_build.build_timestamp,
+        "git_commit": final.kg_build.git_commit,
+    }
+    status: dict[str, Any]
+    if not path.exists():
+        status = {"panel": label, "status": "unpinned", "recorded": None, "expected": expected}
+    else:
+        recorded = json.loads(path.read_text())
+        drift = {
+            field: {"panel": recorded.get(field), "finalizing_run": expected[field]}
+            for field in PINNED_FIELDS
+            if recorded.get(field) != expected[field]
+        }
+        status = {
+            "panel": label,
+            "status": "match" if not drift else "drift",
+            "drift": drift or None,
+            "recorded": {field: recorded.get(field) for field in PINNED_FIELDS},
+        }
+    if status["status"] != "match" and not allow_unpinned:
+        detail = status.get("drift") or "no sidecar was written"
+        raise BackendDriftError(
+            f"{label}: checkpoint provenance is {status['status']}. Refusing to combine "
+            f"panels that cannot be attributed to one backend; {detail}. Re-resolve the panel, "
+            "or pass --allow-unpinned-checkpoints to publish the run with the gap recorded "
+            "in the manifest."
+        )
+    return status
+
+
+def resolve_panel(
+    mapper: ApiMapper,
+    panel: CohortPanel,
+    out_dir: Path,
+    label: str,
+    provenance: RunProvenance | None = None,
+) -> pd.DataFrame:
+    """Resolve one panel name-only; checkpoint the mapped TSV so a mid-run 5xx loses nothing.
+
+    ``provenance`` is written beside the checkpoint when supplied, which is what lets a later
+    ``--link-only`` pass verify that every panel was answered by the same backend.
+    """
     dest = out_dir / f"{label}_MAPPED.tsv"
     names = panel.names
     if dest.exists():
@@ -197,6 +306,8 @@ def resolve_panel(mapper: ApiMapper, panel: CohortPanel, out_dir: Path, label: s
     (out_dir / f"{label}_stats.json").write_text(json.dumps(stats, indent=2, default=str))
     mapped = pd.read_csv(out_tsv, sep="\t", dtype=str).fillna("")
     assert_alignment(mapped, names, label)
+    if provenance is not None:
+        write_panel_provenance(out_dir, label, provenance)
     return mapped
 
 
@@ -398,9 +509,24 @@ def run_links(
     curies: dict[str, dict[str, frozenset[str]]],
     refmet_map: dict[str, str],
     out_dir: Path,
+    errored: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
+    """Link every NECS<->cohort pair, reconstruct Arm B, and write the per-pair artifacts.
+
+    ``errored`` names the rows the deployment never answered, per panel. They are excluded from the
+    unresolved counts and from the unresolved CSVs: an errored row already carries an empty CURIE
+    set,
+    so leaving it in would report the same deployment failure twice, once as an error and again as a
+    metabolite that genuinely did not resolve, inflating the published unresolved total.
+    """
+    errored = errored or {}
     necs_names = panels["necs"].names
     results: dict[str, Any] = {}
+
+    def unresolved_names(label: str) -> list[str]:
+        failed = errored.get(label, set())
+        return [name for name, curie in curies[label].items() if not curie and name not in failed]
+
     for cohort in COHORTS:
         overlap = link_by_intersection(curies["necs"], curies[cohort])
         derived = arm_b_overlap(cohort, necs_names, panels[cohort].names, refmet_map=refmet_map)
@@ -421,8 +547,10 @@ def run_links(
             "arm_m_cohort_linked": overlap.n_b_linked,
             "necs_comparable": overlap.n_a_comparable,
             "cohort_comparable": overlap.n_b_comparable,
-            "necs_unresolved": len(curies["necs"]) - overlap.n_a_comparable,
-            "cohort_unresolved": len(curies[cohort]) - overlap.n_b_comparable,
+            "necs_unresolved": len(unresolved_names("necs")),
+            "cohort_unresolved": len(unresolved_names(cohort)),
+            "necs_errored": len(errored.get("necs", set())),
+            "cohort_errored": len(errored.get(cohort, set())),
             "arm_b_rederived": derived.count,
             "arm_b_method": derived.method,
             "monti_published": published,
@@ -449,11 +577,17 @@ def run_links(
                 for link in overlap.links
             ]
         ).to_csv(out_dir / f"links_necs_{cohort}.csv", index=False)
-        pd.DataFrame({"name": [n for n, s in curies[cohort].items() if not s]}).to_csv(
+        pd.DataFrame({"name": unresolved_names(cohort)}).to_csv(
             out_dir / f"unresolved_{cohort}.csv", index=False
         )
-    pd.DataFrame({"name": [n for n, s in curies["necs"].items() if not s]}).to_csv(
+        pd.DataFrame({"name": sorted(errored.get(cohort, set()))}).to_csv(
+            out_dir / f"errored_{cohort}.csv", index=False
+        )
+    pd.DataFrame({"name": unresolved_names("necs")}).to_csv(
         out_dir / "unresolved_necs.csv", index=False
+    )
+    pd.DataFrame({"name": sorted(errored.get("necs", set()))}).to_csv(
+        out_dir / "errored_necs.csv", index=False
     )
     return results
 
@@ -486,6 +620,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--link-only",
         action="store_true",
         help="Skip resolution; link and score from the existing per-panel checkpoints",
+    )
+    parser.add_argument(
+        "--allow-unpinned-checkpoints",
+        action="store_true",
+        help="Combine checkpoints whose backend cannot be confirmed against the finalizing probe. "
+        "Off by default: a cross-cohort overlap spanning two graph builds is a number no single "
+        "backend produced. When on, the gap is recorded in the manifest rather than hidden.",
     )
     return parser
 
@@ -542,20 +683,40 @@ def main(argv: list[str] | None = None) -> int:
     mapped: dict[str, pd.DataFrame] = {}
     curies: dict[str, dict[str, frozenset[str]]] = {}
     repairs: dict[str, dict[str, Any]] = {}
+    errored: dict[str, set[str]] = {}
+    pins: dict[str, dict[str, Any]] = {}
     for label in PANELS:
         checkpoint = out_dir / f"{label}_MAPPED.tsv"
-        if args.link_only and not checkpoint.exists():
+        existed_before = checkpoint.exists()
+        if args.link_only and not existed_before:
             print(f"[fatal] --link-only but {checkpoint} is missing", file=sys.stderr)
             return 2
-        frame = resolve_panel(mapper, panels[label], out_dir, label)
+        frame = resolve_panel(mapper, panels[label], out_dir, label, provenance)
         frame, repairs[label] = repair_errored_rows(mapper, frame, out_dir, label)
+        # A checkpoint this process resolved was pinned above; one it inherited has to be checked
+        # against the finalizing probe, because it may have come from another deployment or build.
+        if existed_before:
+            pins[label] = check_panel_provenance(
+                out_dir, label, provenance, allow_unpinned=args.allow_unpinned_checkpoints
+            )
+        else:
+            pins[label] = {"panel": label, "status": "match", "drift": None}
         mapped[label] = frame
         curies[label] = curies_by_name(frame, label)
+        errored[label] = set(errored_names(frame))
         print(
             f"[resolve] {label}: {sum(1 for s in curies[label].values() if s)}/"
             f"{len(curies[label])} with a non-empty identifier-only CURIE set, "
-            f"{repairs[label]['still_errored']} errored",
+            f"{repairs[label]['still_errored']} errored, provenance={pins[label]['status']}",
             flush=True,
+        )
+
+    unpinned = {k: v["status"] for k, v in pins.items() if v["status"] != "match"}
+    if unpinned:
+        print(
+            f"[warn] panels whose backend could not be confirmed against the finalizing probe: "
+            f"{unpinned}. The manifest records this; these numbers are NOT single-backend pinned.",
+            file=sys.stderr,
         )
 
     unrecovered = {k: v["still_errored"] for k, v in repairs.items() if v["still_errored"]}
@@ -568,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     refmet_map = load_refmet_map(args.refmet_cache)
-    results = run_links(panels, curies, refmet_map, out_dir)
+    results = run_links(panels, curies, refmet_map, out_dir, errored)
 
     manifest = {
         "arm": "M (BioMapper, names only) vs B (Monti method, re-derived) vs Monti published",
@@ -635,6 +796,19 @@ def main(argv: list[str] | None = None) -> int:
         },
         "certificate_tallies": {k: certificate_tally(v) for k, v in mapped.items()},
         "chosen_namespace_tallies": {k: chosen_prefix_tally(v) for k, v in mapped.items()},
+        "checkpoint_provenance": {
+            "per_panel": pins,
+            "unconfirmed": unpinned,
+            "allow_unpinned_checkpoints": args.allow_unpinned_checkpoints,
+            "note": (
+                "Panels are resolved as separate processes and combined here, so each checkpoint "
+                "records the backend that answered it and is checked against the finalizing probe. "
+                "A cross-cohort overlap built from two different graph builds is a number no "
+                "single "
+                "backend produced, which is why a mismatch aborts unless it is explicitly allowed "
+                "and recorded."
+            ),
+        },
         "mapping_errors": {
             "repair_pass": repairs,
             "unrecovered_by_panel": unrecovered,
