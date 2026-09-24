@@ -88,6 +88,13 @@ def test_the_resolver_paces_requests_and_not_cache_hits(sleeps):
     assert session.calls == 1  # one request, two cache hits
     assert sleeps == []  # and the first request has no predecessor to space from
 
+    # A DISTINCT identifier must still be paced. Without this the test would pass with pacing
+    # removed altogether, which makes it a test of the cache rather than of the fix.
+    resolver._cached_resolve("pubchem:5794", "compound/cid/5794/property/InChIKey/TXT")
+    assert session.calls == 2
+    assert len(sleeps) == 1
+    assert 0 < sleeps[0] <= 0.25
+
 
 def test_the_resolver_without_a_pacer_is_unchanged(sleeps):
     # The suite constructs this resolver with no pacer; that path must not start sleeping.
