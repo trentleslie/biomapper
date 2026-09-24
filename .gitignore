@@ -87,3 +87,6 @@ Thumbs.db
 # Local code-intelligence indexes (memtrace / repowise). Machine-local caches, never committed.
 .memdb/
 .repowise/
+
+# Local MCP server config: machine-specific absolute paths, per-developer tooling choice.
+.mcp.json
