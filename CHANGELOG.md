@@ -24,6 +24,26 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The package version has one source of truth again, and every run records the client commit.**
+  `pyproject.toml` said `1.5.1` while `src/biomapper/__init__.py` carried a hardcoded
+  `__version__ = "1.4.0"`, and the newest tag was `v1.4.0`. Three answers to "what version is
+  this?" meant no run manifest could name its own client unambiguously, which makes every number
+  the suite produces unauditable after the fact.
+
+  `__version__` is now derived from the installed distribution metadata that Poetry builds from
+  `pyproject.toml`, so `pyproject.toml` is the only place a version literal may appear.
+  `provenance.package_version()` reads the same source, so the manifest field and the importable
+  attribute cannot disagree. `tests/test_version.py` fails the build if a literal reappears
+  anywhere under `src/`, because a convention nobody checks is one that drifts back.
+
+  A version string alone was never sufficient, so the manifest now also records
+  `client_git_commit` and `client_git_dirty`, captured at run start. The installed metadata does
+  not move when the working tree does: a 17-hour suite run on an editable checkout absorbed 20+
+  commits mid-flight while still reporting one confident-looking version. The commit is what
+  closes that gap. Both fields read `unknown` / `null` for an installed wheel, which is correct
+  rather than a failure, since a wheel's version is its identity. Capture never raises; provenance
+  must not be able to abort a run that is otherwise fine.
+
 - **The corrupt `4000` gold sentinel no longer becomes a comparable InChIKey block.**
   `cross_cohort_certify.necs_gold_blocks` called `first_block` on the MOESM5 gold cells without
   screening them, so the documented corrupt `4000` placeholder became a 4-character "block". A

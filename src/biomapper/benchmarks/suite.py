@@ -180,6 +180,8 @@ def run_suite(
             "endpoint_alias": endpoint if endpoint in ENDPOINTS else None,
             "authenticated": bool(api_key),
             "biomapper_version": provenance.biomapper_version,
+            "client_git_commit": provenance.client_git_commit,
+            "client_git_dirty": provenance.client_git_dirty,
             "kestrel_url": kestrel_url,
             "kestrel_version": provenance.kestrel_version,
             "kg_version": kg.kg_version,

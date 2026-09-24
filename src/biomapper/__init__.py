@@ -41,6 +41,7 @@ Quick start::
     print(report.n_links, report.a_unresolved)
 """
 
+from biomapper._version import resolve_version as _resolve_version
 from biomapper.client import BioMapperClient
 from biomapper.dataset import map_dataset_file_sync
 from biomapper.exceptions import (
@@ -72,7 +73,16 @@ from biomapper.models import (
     VocabularyInfo,
 )
 
-__version__ = "1.4.0"
+# Single-sourced from the installed distribution metadata, which Poetry builds from
+# ``pyproject.toml``. It is deliberately NOT a literal here: a second literal is a second source of
+# truth, and the two drifted (pyproject 1.5.1 against a hardcoded 1.4.0) for long enough that no run
+# manifest could name its own package version unambiguously. ``pyproject.toml`` is the one source;
+# ``tests/test_version.py`` fails the build if this module ever reintroduces a literal.
+#
+# Resolution AND the uninstalled fallback both live in ``biomapper._version`` so that this attribute
+# and ``provenance.package_version()`` cannot answer differently in any case, including the
+# no-metadata one.
+__version__ = _resolve_version()
 
 __all__ = [
     # Client
