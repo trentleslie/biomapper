@@ -31,6 +31,7 @@ from biomapper.benchmarks.cross_cohort import (
     assert_alignment,
     check_panel_provenance,
     client_repo_provenance,
+    comparator_independence,
     cross_check_harmonize,
     curies_by_name,
     errored_names,
@@ -757,3 +758,39 @@ def test_run_links_asserts_the_two_linkers_agree(tmp_path):
     results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
     for cohort in ("arivale", "xuetal", "llfs", "blsa"):
         assert results[cohort]["harmonize_cross_check"]["agree"] is True
+
+
+# ==================================================================================================
+# Accuracy versus coverage, derived from the build's own source list
+# ==================================================================================================
+
+
+def test_refmet_pairs_are_labelled_coverage_when_refmet_is_in_the_graph():
+    # Monti matched NECS to LLFS and BLSA on RefMet names, and RefMet is ingested into KRAKEN and is
+    # the resolver's source-weighting target, so the comparison runs through a shared vocabulary.
+    for cohort in ("llfs", "blsa"):
+        note = comparator_independence(cohort, ["refmet", "kg2", "babel"])
+        assert note["label"] == "coverage"
+        assert note["comparator_source_in_graph"] == "refmet"
+
+
+def test_chemical_name_pairs_are_not_labelled_coverage():
+    # Metabolon CHEMICAL_NAME is vendor curation, not a graph source.
+    for cohort in ("arivale", "xuetal"):
+        note = comparator_independence(cohort, ["refmet", "kg2", "babel"])
+        assert note["label"] == "accuracy_candidate"
+        assert note["comparator_source_in_graph"] is None
+
+
+def test_the_label_tracks_the_build_rather_than_an_assertion():
+    # If a build ever stopped ingesting refmet, the label would move with it.
+    assert comparator_independence("llfs", ["kg2", "babel"])["label"] == "accuracy_candidate"
+
+
+def test_run_links_records_the_label_per_pair(tmp_path):
+    panels, curies = _link_fixture()
+    results = run_links(
+        panels, curies, {"glucose": "Glucose"}, tmp_path, kg_sources=["refmet", "kg2"]
+    )
+    assert results["llfs"]["comparator_independence"]["label"] == "coverage"
+    assert results["arivale"]["comparator_independence"]["label"] == "accuracy_candidate"

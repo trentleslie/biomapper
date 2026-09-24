@@ -504,12 +504,64 @@ def cross_check_harmonize(
     }
 
 
+# Which KRAKEN-ingested source, if any, the pair's PUBLISHED comparator was built from. Monti
+# matched NECS to Arivale and to Xu on Metabolon CHEMICAL_NAME, which is vendor curation and not a
+# graph source. NECS to LLFS and to BLSA were matched on RefMet standardized names, and RefMet is
+# both ingested into KRAKEN and the resolver's source-weighting target.
+COMPARATOR_SOURCE: dict[str, str | None] = {
+    "arivale": None,
+    "xuetal": None,
+    "llfs": "refmet",
+    "blsa": "refmet",
+}
+
+
+def comparator_independence(cohort: str, kg_sources: list[str]) -> dict[str, Any]:
+    """Label a pair accuracy-candidate or coverage, against the build's own ``sources`` list.
+
+    The guardrail this implements: a benchmark whose gold or comparator comes from a vocabulary
+    baked into the graph is measuring coverage, not accuracy. Derived from the live source list per
+    run, so the label tracks the build rather than a note that goes stale.
+
+    Note what is and is not being claimed. The NECS gold itself is Metabolon vendor curation and is
+    not a graph source, so the NAMES are never circular. The question here is about the COMPARATOR.
+    On the two RefMet pairs, BioMapper answers predominantly with ``RM:*`` nodes while the baseline
+    is a RefMet name join, so "BioMapper recovers more links than the published method" on those
+    pairs compares two readings of one vocabulary. That is a coverage statement. On the two
+    CHEMICAL_NAME pairs the comparator sits outside the graph, so the comparison is cleaner.
+    """
+    present = {s.lower() for s in kg_sources}
+    source = COMPARATOR_SOURCE[cohort]
+    if source and source in present:
+        return {
+            "label": "coverage",
+            "comparator_source_in_graph": source,
+            "reason": (
+                f"the published comparator for this pair is a {source} name join, and {source!r} "
+                "is ingested into the graph being measured and is the resolver's source-weighting "
+                "target. BioMapper's answer and the comparator therefore share a vocabulary; "
+                "report the difference as coverage, not accuracy."
+            ),
+        }
+    return {
+        "label": "accuracy_candidate",
+        "comparator_source_in_graph": None,
+        "reason": (
+            "the published comparator for this pair is Metabolon CHEMICAL_NAME vendor curation, "
+            "which is not a KRAKEN-ingested source, so the comparison does not run through a "
+            "shared vocabulary. Not a full independence verdict: this arm measures links "
+            "recovered, not structural correctness, and certification is reported separately."
+        ),
+    }
+
+
 def run_links(
     panels: dict[str, CohortPanel],
     curies: dict[str, dict[str, frozenset[str]]],
     refmet_map: dict[str, str],
     out_dir: Path,
     errored: dict[str, set[str]] | None = None,
+    kg_sources: list[str] | None = None,
 ) -> dict[str, Any]:
     """Link every NECS<->cohort pair, reconstruct Arm B, and write the per-pair artifacts.
 
@@ -520,6 +572,7 @@ def run_links(
     metabolite that genuinely did not resolve, inflating the published unresolved total.
     """
     errored = errored or {}
+    kg_sources = kg_sources if kg_sources is not None else []
     necs_names = panels["necs"].names
     results: dict[str, Any] = {}
 
@@ -560,6 +613,7 @@ def run_links(
             "arm_m_vs_arm_b": overlap.n_a_linked - derived.count,
             "arm_m_vs_published": overlap.n_a_linked - published,
             "harmonize_cross_check": cross_check_harmonize(curies["necs"], curies[cohort]),
+            "comparator_independence": comparator_independence(cohort, kg_sources),
         }
         print(
             f"[pair] NECS<->{cohort}: Arm-M necs-linked={overlap.n_a_linked} "
@@ -736,7 +790,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     refmet_map = load_refmet_map(args.refmet_cache)
-    results = run_links(panels, curies, refmet_map, out_dir, errored)
+    results = run_links(
+        panels, curies, refmet_map, out_dir, errored, provenance.kg_build.sources
+    )
 
     manifest = {
         "arm": "M (BioMapper, names only) vs B (Monti method, re-derived) vs Monti published",
