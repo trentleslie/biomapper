@@ -828,3 +828,17 @@ def test_run_links_carries_the_reconstruction_basis(tmp_path):
     results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
     assert results["llfs"]["arm_b_reconstruction_basis"]["method"] == "refmet"
     assert results["arivale"]["arm_b_reconstruction_basis"]["method"] == "name"
+
+
+def test_sidecar_records_a_run_start_client_capture(tmp_path):
+    captured = {"repo": "/repo", "commit": "b" * 40, "dirty": False}
+    record = write_panel_provenance(tmp_path, "necs", _provenance(), captured)
+    assert record["client_repo"]["commit"] == "b" * 40
+    assert record["client_repo"]["captured"] == "at run start"
+
+
+def test_sidecar_flags_a_late_client_capture_rather_than_passing_it_off(tmp_path):
+    # The sidecar is written after a panel finishes, possibly an hour later. Reading the working
+    # tree then would attribute the panel to whatever the repo has become, so the fallback says so.
+    record = write_panel_provenance(tmp_path, "necs", _provenance())
+    assert record["client_repo"]["captured"] == "late (at sidecar write)"

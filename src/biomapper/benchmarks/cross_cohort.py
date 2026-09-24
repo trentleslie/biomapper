@@ -201,14 +201,29 @@ def panel_provenance_path(out_dir: Path, label: str) -> Path:
     return out_dir / f"{label}_provenance.json"
 
 
-def write_panel_provenance(out_dir: Path, label: str, provenance: RunProvenance) -> dict[str, Any]:
+def write_panel_provenance(
+    out_dir: Path,
+    label: str,
+    provenance: RunProvenance,
+    client_repo: dict[str, str | bool | None] | None = None,
+) -> dict[str, Any]:
     """Record which backend answered THIS panel, next to its checkpoint.
 
     Panels are resolved as separate processes and combined later, so a single provenance probe taken
     at link time would stamp one graph build onto checkpoints that may have been produced by
     another. Each panel therefore carries its own pin, and :func:`check_panel_provenance` refuses to
     combine checkpoints that disagree.
+
+    ``client_repo`` must be captured when the run STARTS, not here. The sidecar is written after a
+    panel finishes, which can be an hour later; reading the working tree at that point would
+    attribute the panel to whatever the repository happens to be at write time rather than to the
+    code that was loaded when the process began. Falling back to reading it here is strictly worse
+    than nothing would be, so the fallback is recorded as late-captured.
     """
+    if client_repo is None:
+        client_repo = {**client_repo_provenance(), "captured": "late (at sidecar write)"}
+    else:
+        client_repo = {**client_repo, "captured": "at run start"}
     record = {
         "panel": label,
         "endpoint": provenance.api_endpoint,
@@ -221,7 +236,7 @@ def write_panel_provenance(out_dir: Path, label: str, provenance: RunProvenance)
         "source_versions": provenance.kg_build.source_versions,
         "resolved_at": provenance.run_timestamp,
         "biomapper_version": provenance.biomapper_version,
-        "client_repo": client_repo_provenance(),
+        "client_repo": client_repo,
     }
     panel_provenance_path(out_dir, label).write_text(json.dumps(record, indent=2, default=str))
     return record
@@ -279,6 +294,7 @@ def resolve_panel(
     out_dir: Path,
     label: str,
     provenance: RunProvenance | None = None,
+    client_repo: dict[str, str | bool | None] | None = None,
 ) -> pd.DataFrame:
     """Resolve one panel name-only; checkpoint the mapped TSV so a mid-run 5xx loses nothing.
 
@@ -308,7 +324,7 @@ def resolve_panel(
     mapped = pd.read_csv(out_tsv, sep="\t", dtype=str).fillna("")
     assert_alignment(mapped, names, label)
     if provenance is not None:
-        write_panel_provenance(out_dir, label, provenance)
+        write_panel_provenance(out_dir, label, provenance, client_repo)
     return mapped
 
 
@@ -762,6 +778,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Captured here, at run start, so a sidecar written an hour later still names the code that was
+    # loaded when the process began rather than whatever the tree looks like at write time.
+    client_repo = client_repo_provenance()
+
     if args.panel is not None and not args.link_only:
         mapper = ApiMapper(
             args.endpoint,
@@ -769,7 +789,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             timeout=args.timeout,
         )
-        resolve_panel(mapper, panels[args.panel], out_dir, args.panel, provenance)
+        resolve_panel(mapper, panels[args.panel], out_dir, args.panel, provenance, client_repo)
         (out_dir / f"{args.panel}_counters.json").write_text(
             json.dumps(mapper.counters.snapshot(), indent=2, default=str)
         )
@@ -800,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.link_only and not existed_before:
             print(f"[fatal] --link-only but {checkpoint} is missing", file=sys.stderr)
             return 2
-        frame = resolve_panel(mapper, panels[label], out_dir, label, provenance)
+        frame = resolve_panel(mapper, panels[label], out_dir, label, provenance, client_repo)
         frame, repairs[label] = repair_errored_rows(mapper, frame, out_dir, label)
         # A checkpoint this process resolved was pinned above; one it inherited has to be checked
         # against the finalizing probe, because it may have come from another deployment or build.
