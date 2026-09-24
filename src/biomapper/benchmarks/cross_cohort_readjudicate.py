@@ -33,11 +33,16 @@ Outcomes, and what each licenses:
 ``conjugate_linked_to_parent``
     DIFFERENT vendor names, one a derivative of the other. Not a lookup artifact, a wrong link.
     Observed live on "n-oleoyltaurine" linked to "taurine".
-``distinct_vendor_names_unverified_structure``
-    The two linked entities carry different vendor names and the outside source resolved neither.
-    The name difference is still evidence against the link, so this is NOT "nothing concluded":
-    it needs a hand check. Dominant among refuted links here, because the linker joins distinct
-    Metabolon lipid species that share a KRAKEN identifier.
+``differing_lipid_chain_annotation``
+    Both vendor names carry an acyl-composition annotation and the two DIFFER, so the names state
+    different compositions. Adverse evidence needing no structure lookup. Dominant among refuted
+    links here, because the linker joins distinct Metabolon lipid species that share a KRAKEN
+    identifier, which is a precision failure in the graph's lipid identifiers.
+``distinct_vendor_names_structure_unverified``
+    Different vendor names, nothing resolved, and no composition annotation that contradicts.
+    Explicitly NOT adverse: two cohorts can legitimately use synonyms or different formatting. This
+    bucket holds both synonyms and genuinely different compounds, so triage it rather than counting
+    it either way.
 ``necs_gold_suspect``
     The outside source agrees with the cohort side and disagrees with the NECS gold. This is the
     documented ~5% gold defect showing up, not a BioMapper error.
@@ -60,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -70,6 +76,7 @@ from urllib.parse import quote
 import pandas as pd
 
 from biomapper.benchmarks.adapters.metlinkr import force_ipv4
+from biomapper.benchmarks.pacing import PUBCHEM_MIN_INTERVAL_S, Pacer
 from biomapper.benchmarks.scorers.independent_inchikey import _PUG_REST, _first_block
 
 # Monoisotopic masses agree to well under this when two records describe one compound; a real
@@ -135,6 +142,34 @@ def formulas_differ_only_in_hydrogen(left: str | None, right: str | None) -> boo
     if a is None or b is None:
         return False
     return {k: v for k, v in a.items() if k != "H"} == {k: v for k, v in b.items() if k != "H"}
+
+
+# Metabolon vendor names encode acyl composition in a parenthetical annotation: "(d18:1/16:0)",
+# "(16:0/18:2)", "(c6)". When BOTH sides of a link carry one and they DIFFER, the names themselves
+# state different compositions, which is evidence about the link independent of any structure
+# lookup. When they do not both carry one, name inequality alone proves nothing: two cohorts can
+# legitimately use synonyms or different formatting for the same metabolite.
+_CHAIN_ANNOTATION = re.compile(
+    r"\(([a-z]?\d{1,2}:\d(?:[;/][^)]*)?(?:/[a-z]?\d{1,2}:\d)*[^)]*)\)", re.IGNORECASE
+)
+
+
+def chain_annotations(name: str) -> frozenset[str]:
+    """Acyl-composition tokens from a vendor name, lower-cased and whitespace-stripped."""
+    return frozenset(
+        m.group(1).lower().replace(" ", "") for m in _CHAIN_ANNOTATION.finditer(name or "")
+    )
+
+
+def annotations_state_different_composition(left: str, right: str) -> bool:
+    """True when both names carry an acyl annotation and the two annotations differ.
+
+    Deliberately requires BOTH sides to carry one. A name with no annotation says nothing about
+    composition, so comparing an annotated name against an unannotated one would turn "we cannot
+    tell" into "these differ".
+    """
+    a, b = chain_annotations(left), chain_annotations(right)
+    return bool(a) and bool(b) and a != b
 
 
 def composition_relation(left: OutsideRecord, right: OutsideRecord) -> str:
@@ -223,15 +258,6 @@ def suspected_derivative(left: OutsideRecord, right: OutsideRecord) -> bool:
     )
 
 
-# PubChem PUG-REST asks for no more than 5 requests per second. The certification path learned this
-# the expensive way: ~592 unspaced lookups returned 109 `lookup_failed`, which became 169 refusals
-# that were run artifacts rather than absent structures. The same throttle has to live here, because
-# this module fires up to two lookups per non-certified case. Duplicating the rule in two modules is
-# how one copy gets the fix and its sibling does not, so the constant is named in both and this
-# comment points at the other.
-PUBCHEM_MIN_INTERVAL_S = 0.25
-
-
 class OutsideResolver:
     """PubChem name-index lookups returning block, formula and mass together.
 
@@ -255,8 +281,7 @@ class OutsideResolver:
         self._timeout = timeout
         self._session = session or requests.Session()
         self._cache: dict[str, OutsideRecord] = {}
-        self._min_interval_s = min_interval_s
-        self._last_request_at = 0.0
+        self._pacer = Pacer(min_interval_s)
 
     def by_name(self, name: str) -> OutsideRecord:
         return self._resolve(f"name:{name}", f"compound/name/{quote(name, safe='')}")
@@ -270,7 +295,7 @@ class OutsideResolver:
         # bank a refusal the service would not have given a minute later.
         if cached is not None and cached.status != "lookup_failed":
             return cached
-        self._throttle()
+        self._pacer.wait()
         url = f"{_PUG_REST}/{path}/property/{PROPERTIES}/JSON"
         try:
             with force_ipv4():
@@ -287,17 +312,6 @@ class OutsideResolver:
             record = self._parse(response.text)
         self._cache[cache_key] = record
         return record
-
-    def _throttle(self) -> None:
-        """Space outgoing requests. Called only on a cache miss, just before the request."""
-        import time
-
-        if self._min_interval_s <= 0:
-            return
-        elapsed = time.monotonic() - self._last_request_at
-        if elapsed < self._min_interval_s:
-            time.sleep(self._min_interval_s - elapsed)
-        self._last_request_at = time.monotonic()
 
     @staticmethod
     def _parse(body: str) -> OutsideRecord:
@@ -335,6 +349,8 @@ def classify(
     outside_cohort: OutsideRecord,
     *,
     same_name: bool = True,
+    necs_name: str = "",
+    cohort_name: str = "",
 ) -> tuple[str, str]:
     """Return ``(outcome, rationale)`` for one non-certified case.
 
@@ -353,13 +369,28 @@ def classify(
     # silent-wrong-answer shape as the rest of this module, pointed the other way round: it hides a
     # real defect behind a missing lookup.
     neither_resolved = not outside_necs.resolved and not outside_cohort.resolved
+    differing_composition = annotations_state_different_composition(necs_name, cohort_name)
     if not same_name and neither_resolved:
+        # Name inequality ALONE is not adverse evidence: two cohorts can legitimately use synonyms
+        # or different formatting for one metabolite, and calling that suspicious would inflate the
+        # triage pile with valid pairs. A DIFFERING acyl annotation is not mere inequality though,
+        # it is the names stating different compositions, and that stands with no lookup at all.
+        if differing_composition:
+            return (
+                "differing_lipid_chain_annotation",
+                "the two linked entities carry DIFFERENT acyl-composition annotations "
+                f"({sorted(chain_annotations(necs_name))} vs "
+                f"{sorted(chain_annotations(cohort_name))}), so the vendor names themselves state "
+                "different compositions. The outside source resolved neither, but it does not need "
+                "to: this is a wrong link, and the shared identifier behind it is a precision "
+                "failure in the graph's lipid identifiers",
+            )
         return (
-            "distinct_vendor_names_unverified_structure",
-            "the two linked entities carry DIFFERENT vendor names and the outside source could "
-            "resolve neither, so the structures are unverified. The name difference still stands "
-            "as evidence against the link, and this must not be counted as a clean refusal nor "
-            "waved off as unadjudicated: check it by hand",
+            "distinct_vendor_names_structure_unverified",
+            "the two linked entities carry different vendor names, neither resolved against the "
+            "outside source, and neither name states a composition that contradicts the other. "
+            "This bucket holds BOTH legitimate synonyms and genuinely different compounds, so it "
+            "is not evidence either way: triage it, do not count it as a refusal or as a pass",
         )
 
     if neither_resolved:
@@ -499,6 +530,8 @@ def readjudicate(cases: pd.DataFrame, resolver: OutsideResolver) -> pd.DataFrame
             outside_necs,
             outside_cohort,
             same_name=same_name,
+            necs_name=necs_name,
+            cohort_name=cohort_name,
         )
         rows.append(
             {

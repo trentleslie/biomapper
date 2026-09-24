@@ -11,6 +11,8 @@ import pandas as pd
 from biomapper.benchmarks.cross_cohort_readjudicate import (
     OutsideRecord,
     OutsideResolver,
+    annotations_state_different_composition,
+    chain_annotations,
     classify,
     composition_relation,
     formula_contains,
@@ -382,7 +384,7 @@ def test_throttling_can_be_disabled_for_tests():
             raise AssertionError("should not be called")
 
     resolver = OutsideResolver(session=_Session(), min_interval_s=0)
-    assert resolver._min_interval_s == 0
+    assert resolver._pacer.min_interval_s == 0
 
 
 # ==================================================================================================
@@ -390,13 +392,63 @@ def test_throttling_can_be_disabled_for_tests():
 # ==================================================================================================
 
 
-def test_differing_names_with_no_outside_structure_is_not_shrugged_off():
+def test_differing_chain_annotations_are_adverse_without_any_lookup():
     # Observed live: "palmitoyl sphingomyelin (d18:1/16:0)" linked to "stearoyl sphingomyelin
-    # (d18:1/18:0)". PubChem cannot parse Metabolon shorthand, but the names specify different chain
-    # lengths, so reporting "nothing concluded" would hide a wrong link behind a missing lookup.
-    outcome, rationale = classify(GLUCOSE, OTHER, _MISS, _MISS, same_name=False)
-    assert outcome == "distinct_vendor_names_unverified_structure"
-    assert "must not be counted as a clean refusal" in rationale
+    # (d18:1/18:0)". PubChem cannot parse Metabolon shorthand, but the names state different
+    # compositions, so reporting "nothing concluded" would hide a wrong link behind a missing
+    # lookup.
+    outcome, rationale = classify(
+        GLUCOSE,
+        OTHER,
+        _MISS,
+        _MISS,
+        same_name=False,
+        necs_name="palmitoyl sphingomyelin (d18:1/16:0)",
+        cohort_name="stearoyl sphingomyelin (d18:1/18:0)",
+    )
+    assert outcome == "differing_lipid_chain_annotation"
+    assert "wrong link" in rationale
+
+
+def test_bare_name_inequality_is_not_treated_as_adverse():
+    # Two cohorts can legitimately use synonyms or different formatting for one metabolite. Calling
+    # that suspicious would inflate the triage pile with valid pairs.
+    outcome, rationale = classify(
+        GLUCOSE,
+        OTHER,
+        _MISS,
+        _MISS,
+        same_name=False,
+        necs_name="vitamin E",
+        cohort_name="alpha-tocopherol",
+    )
+    assert outcome == "distinct_vendor_names_structure_unverified"
+    assert "not evidence either way" in rationale
+
+
+def test_an_annotation_on_only_one_side_proves_nothing():
+    # Comparing an annotated name against an unannotated one would turn "cannot tell" into "differ".
+    assert annotations_state_different_composition(
+        "palmitoyl sphingomyelin (d18:1/16:0)", "SM"
+    ) is (False)
+    assert annotations_state_different_composition("glucose", "dextrose") is False
+
+
+def test_matching_annotations_are_not_adverse():
+    # Same chains, different head group (GPC vs GPE) still lands in the triage bucket rather than
+    # being asserted either way: the annotation does not discriminate here.
+    assert (
+        annotations_state_different_composition(
+            "1-palmitoyl-2-linoleoyl-gpc (16:0/18:2)", "1-palmitoyl-2-linoleoyl-GPE (16:0/18:2)"
+        )
+        is False
+    )
+
+
+def test_chain_annotations_are_extracted_case_and_space_insensitively():
+    assert chain_annotations("palmitoyl sphingomyelin (d18:1/16:0)") == frozenset({"d18:1/16:0"})
+    assert chain_annotations("hexanoylcarnitine (C6)") == frozenset()  # not an acyl x:y token
+    assert chain_annotations("no annotation here") == frozenset()
 
 
 def test_same_name_with_no_outside_structure_stays_unadjudicated():
@@ -436,4 +488,5 @@ def test_readjudicate_derives_name_equality_and_records_it():
     result = readjudicate(cases, resolver)  # type: ignore[arg-type]
     row = result.iloc[0]
     assert bool(row["same_vendor_name"]) is False
-    assert row["readjudication"] == "distinct_vendor_names_unverified_structure"
+    # Neither name carries an acyl annotation, so this is the triage bucket, not adverse evidence.
+    assert row["readjudication"] == "distinct_vendor_names_structure_unverified"

@@ -48,6 +48,7 @@ from biomapper.benchmarks.cross_cohort import (
     DEFAULT_ARIVALE_XLSX,
     sha256_path,
 )
+from biomapper.benchmarks.pacing import PUBCHEM_MIN_INTERVAL_S, Pacer
 from biomapper.benchmarks.scorers.cross_cohort_overlap import Link
 from biomapper.benchmarks.scorers.gold_structure import has_gold_structure
 from biomapper.benchmarks.scorers.independent_inchikey import ProvidedBlock
@@ -182,11 +183,9 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
     return blocks, card
 
 
-# PubChem PUG-REST asks for no more than 5 requests per second. The first live certification run
-# fired ~592 lookups with no spacing and got 109 `lookup_failed` back, which is 109 refusals that
-# were run artifacts rather than absent structures. Spacing the calls is the difference between a
-# refusal that means something and one that means the service pushed back.
-PUBCHEM_MIN_INTERVAL_S = 0.25
+# Re-exported from the shared pacer so both PubChem callers in this package use one implementation.
+# The first live certification run fired ~592 lookups with no spacing and got 109 `lookup_failed`
+# back, which is 109 refusals that were run artifacts rather than absent structures.
 
 
 def arivale_independent_blocks(
@@ -202,13 +201,12 @@ def arivale_independent_blocks(
     ``lookup_failed`` is kept distinct from a ``clean_miss``: a network failure must never be
     reported as an absent structure.
     """
-    import time
-
     from biomapper.benchmarks.scorers.independent_inchikey import PubChemInChIKeyResolver
 
     frame = pd.read_excel(arivale_xlsx, sheet_name="Arivale_Metabolomics", dtype=str).fillna("")
     panel = load_cohort_panel(frame, ARIVALE)
     resolver = PubChemInChIKeyResolver()
+    pacer = Pacer(min_interval_s)
 
     blocks: dict[str, ProvidedBlock] = {}
     statuses: Counter[str] = Counter()
@@ -219,8 +217,6 @@ def arivale_independent_blocks(
             continue
         cid = str(row.get("pubchem", "")).strip()
         hmdb = str(row.get("hmdb", "")).strip()
-        if (cid or hmdb) and min_interval_s:
-            time.sleep(min_interval_s)
         block: str | None = None
         source = "none"
         status = "clean_miss"
@@ -229,12 +225,16 @@ def arivale_independent_blocks(
         # reported coverage gap, and the refusal classifier would then call it a real absence.
         any_transient_failure = False
         if cid:
+            pacer.wait()
             block, status = resolver._cached_resolve(  # noqa: SLF001 - status-aware accessor
                 f"pubchem:{cid}", f"compound/cid/{cid}/property/InChIKey/TXT"
             )
             source = "provided-pubchem"
             any_transient_failure = status == "lookup_failed"
         if block is None and hmdb:
+            # Paced separately. The CID request above already went out, so sleeping once per row
+            # left this fallback unspaced and able to draw a lookup_failed of its own.
+            pacer.wait()
             block, status = resolver._cached_resolve(  # noqa: SLF001
                 f"hmdb:{hmdb}", f"compound/xref/RegistryID/{hmdb}/property/InChIKey/TXT"
             )
