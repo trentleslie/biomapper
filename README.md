@@ -25,9 +25,10 @@ pip install biomapper
 pip install 'biomapper[benchmarks]'
 ```
 
-The benchmark suite requires **1.5.2 or later**. The `benchmarks` extra resolves on earlier
-releases but `biomapper.benchmarks` does not exist before 1.5.2, so the install succeeds and the
-import fails.
+**1.5.2 is the first release on PyPI that contains the benchmark suite.** Earlier published
+releases, up to and including 1.4.0, ship neither `biomapper.benchmarks` nor the `benchmarks`
+extra, so `pip install 'biomapper[benchmarks]'` against them warns that the extra is unknown and
+installs only the core client.
 
 ---
 
