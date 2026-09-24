@@ -381,3 +381,25 @@ def test_coverage_counts_usable_blocks_not_entries(tmp_path):
     assert card["n_entries"] == len(blocks) == 4
     assert card["n_with_curated_inchikey"] == 2
     assert card["coverage"] == 0.5
+
+
+def test_a_necs_side_gap_is_not_attributed_to_the_cohort():
+    # Both sides now carry a tagged entry even with no structure, so a presence test would find the
+    # NECS entry, fall through to the cohort branches, and blame the cohort for a NECS-side gap.
+    cases = adjudicate_cases(
+        [_link()],
+        {"glucose": ProvidedBlock(None, "gold-necs-moesm5", "clean_miss", "moesm5:glucose")},
+        {"glucose": _cohort(GLUCOSE_BLOCK)},  # cohort side is perfectly fine
+    )
+    row = cases.iloc[0]
+    assert row["verdict"] == "refused"
+    assert row["refusal_class"] == "necs_gold_has_no_curated_inchikey"
+
+
+def test_both_sides_tagged_without_blocks_is_its_own_class():
+    cases = adjudicate_cases(
+        [_link()],
+        {"glucose": ProvidedBlock(None, "gold-necs-moesm5", "clean_miss", "moesm5:glucose")},
+        {"glucose": _cohort(None, status="clean_miss")},
+    )
+    assert cases.iloc[0]["refusal_class"] == "no_independent_structure_either_side"

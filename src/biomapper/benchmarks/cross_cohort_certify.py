@@ -315,9 +315,16 @@ def _classify_refusal(a: ProvidedBlock | None, b: ProvidedBlock | None) -> str:
     coverage gaps. Collapsing them into one "refused" bucket is what makes a refusal count look like
     a failure rate.
     """
-    if a is None and (b is None or not b.block):
+    # Tested on the BLOCK, not on entry presence. Both sides now record a tagged entry even when
+    # they have no structure, so an `is None` test would find the NECS entry present, fall through
+    # to the cohort branches, and attribute a NECS-side gap to the cohort. That is what happened the
+    # first time this ran with tagged entries: necs_gold_has_no_curated_inchikey went to zero and
+    # cohort_lookup_clean_miss absorbed its cases.
+    a_has_block = a is not None and bool(a.block)
+    b_has_block = b is not None and bool(b.block)
+    if not a_has_block and not b_has_block:
         return "no_independent_structure_either_side"
-    if a is None:
+    if not a_has_block:
         return "necs_gold_has_no_curated_inchikey"
     if b is None:
         return "cohort_name_absent_from_panel_lookup"
