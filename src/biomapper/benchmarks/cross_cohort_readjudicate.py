@@ -27,9 +27,17 @@ Outcomes, and what each licenses:
     tautomer (artifact) and a constitutional isomer (real error), and composition cannot tell them
     apart. Needs a hand check; must not be counted in either direction.
 ``outside_source_hit_a_derivative``
-    One name resolved to a protected or derivatised analogue of the other. Observed live on
+    The SAME vendor name resolved to a protected or derivatised analogue. Observed live on
     "Prolylleucine", where PubChem's name index returns Cbz-protected Z-Pro-Leu. A failure of the
     lookup, not evidence about the link.
+``conjugate_linked_to_parent``
+    DIFFERENT vendor names, one a derivative of the other. Not a lookup artifact, a wrong link.
+    Observed live on "n-oleoyltaurine" linked to "taurine".
+``distinct_vendor_names_unverified_structure``
+    The two linked entities carry different vendor names and the outside source resolved neither.
+    The name difference is still evidence against the link, so this is NOT "nothing concluded":
+    it needs a hand check. Dominant among refuted links here, because the linker joins distinct
+    Metabolon lipid species that share a KRAKEN identifier.
 ``necs_gold_suspect``
     The outside source agrees with the cohort side and disagrees with the NECS gold. This is the
     documented ~5% gold defect showing up, not a BioMapper error.
@@ -325,6 +333,8 @@ def classify(
     cohort_block: str,
     outside_necs: OutsideRecord,
     outside_cohort: OutsideRecord,
+    *,
+    same_name: bool = True,
 ) -> tuple[str, str]:
     """Return ``(outcome, rationale)`` for one non-certified case.
 
@@ -335,7 +345,24 @@ def classify(
     the composition test get to excuse the difference. Running the artifact test first would
     mis-label every gold defect whose true structure happens to share a formula with the cohort's.
     """
-    if not outside_necs.resolved and not outside_cohort.resolved:
+    # The two linked names being DIFFERENT strings is itself evidence, and it outranks the outside
+    # source. The linker joins by CURIE-set intersection, so a link between "palmitoyl
+    # sphingomyelin (d18:1/16:0)" and "stearoyl sphingomyelin (d18:1/18:0)" is a wrong link
+    # whatever PubChem says: the vendor names specify different chain lengths. Reporting that as
+    # "nothing concluded" because PubChem cannot parse Metabolon shorthand is the same
+    # silent-wrong-answer shape as the rest of this module, pointed the other way round: it hides a
+    # real defect behind a missing lookup.
+    neither_resolved = not outside_necs.resolved and not outside_cohort.resolved
+    if not same_name and neither_resolved:
+        return (
+            "distinct_vendor_names_unverified_structure",
+            "the two linked entities carry DIFFERENT vendor names and the outside source could "
+            "resolve neither, so the structures are unverified. The name difference still stands "
+            "as evidence against the link, and this must not be counted as a clean refusal nor "
+            "waved off as unadjudicated: check it by hand",
+        )
+
+    if neither_resolved:
         return (
             "outside_source_unresolved",
             "PubChem's name index resolved neither side, so nothing is concluded and the refusal "
@@ -378,6 +405,14 @@ def classify(
                 "genuinely wrong. Leucine against isoleucine and Pro-Leu against Leu-Pro both live "
                 "here. Composition cannot separate the two, so this needs a hand check and must "
                 "not be counted in either direction",
+            )
+        if suspected_derivative(outside_necs, outside_cohort) and not same_name:
+            return (
+                "conjugate_linked_to_parent",
+                f"the two linked entities carry different vendor names and one resolves to a "
+                f"derivative of the other ({outside_necs.formula} vs {outside_cohort.formula}). "
+                "That is not a lookup artifact, it is a WRONG LINK: a conjugate joined to its "
+                "parent compound. Observed live on n-oleoyltaurine linked to taurine",
             )
         if suspected_derivative(outside_necs, outside_cohort):
             return (
@@ -453,19 +488,24 @@ def readjudicate(cases: pd.DataFrame, resolver: OutsideResolver) -> pd.DataFrame
                 }
             )
             continue
-        outside_necs = resolver.by_name(str(case["necs_name"]))
-        outside_cohort = resolver.by_name(str(case["cohort_name"]))
+        necs_name = str(case["necs_name"])
+        cohort_name = str(case["cohort_name"])
+        outside_necs = resolver.by_name(necs_name)
+        outside_cohort = resolver.by_name(cohort_name)
+        same_name = necs_name.strip().lower() == cohort_name.strip().lower()
         outcome, rationale = classify(
             str(case.get("necs_block", "")),
             str(case.get("cohort_block", "")),
             outside_necs,
             outside_cohort,
+            same_name=same_name,
         )
         rows.append(
             {
                 **case_fields,
                 "readjudication": outcome,
                 "rationale": rationale,
+                "same_vendor_name": same_name,
                 "outside_necs_block": outside_necs.block or "",
                 "outside_necs_formula": outside_necs.formula or "",
                 "outside_necs_status": outside_necs.status,

@@ -383,3 +383,57 @@ def test_throttling_can_be_disabled_for_tests():
 
     resolver = OutsideResolver(session=_Session(), min_interval_s=0)
     assert resolver._min_interval_s == 0
+
+
+# ==================================================================================================
+# The two linked names differing is evidence, and it outranks a missing lookup
+# ==================================================================================================
+
+
+def test_differing_names_with_no_outside_structure_is_not_shrugged_off():
+    # Observed live: "palmitoyl sphingomyelin (d18:1/16:0)" linked to "stearoyl sphingomyelin
+    # (d18:1/18:0)". PubChem cannot parse Metabolon shorthand, but the names specify different chain
+    # lengths, so reporting "nothing concluded" would hide a wrong link behind a missing lookup.
+    outcome, rationale = classify(GLUCOSE, OTHER, _MISS, _MISS, same_name=False)
+    assert outcome == "distinct_vendor_names_unverified_structure"
+    assert "must not be counted as a clean refusal" in rationale
+
+
+def test_same_name_with_no_outside_structure_stays_unadjudicated():
+    outcome, _ = classify(GLUCOSE, OTHER, _MISS, _MISS, same_name=True)
+    assert outcome == "outside_source_unresolved"
+
+
+def test_a_derivative_across_different_names_is_a_wrong_link_not_a_lookup_artifact():
+    # n-oleoyltaurine linked to taurine. Same evidence as the Prolylleucine case, opposite meaning,
+    # and the earlier version excused it as an outside-source artifact.
+    outcome, rationale = classify(
+        "ZKQOUHVVXABNDG", "YCYXUKRYYSXSLJ", PRO_LEU, Z_PRO_LEU, same_name=False
+    )
+    assert outcome == "conjugate_linked_to_parent"
+    assert "WRONG LINK" in rationale
+
+
+def test_a_derivative_under_the_same_name_is_still_a_lookup_artifact():
+    outcome, _ = classify("ZKQOUHVVXABNDG", "YCYXUKRYYSXSLJ", PRO_LEU, Z_PRO_LEU, same_name=True)
+    assert outcome == "outside_source_hit_a_derivative"
+
+
+def test_readjudicate_derives_name_equality_and_records_it():
+    resolver = _StubResolver({})
+    cases = pd.DataFrame(
+        [
+            {
+                "necs_name": "n-oleoyltaurine",
+                "cohort_name": "taurine",
+                "verdict": "refuted",
+                "refusal_class": "",
+                "necs_block": "KOGRJTUIKPMZEJ",
+                "cohort_block": "XOAAWQZATWQOTB",
+            }
+        ]
+    )
+    result = readjudicate(cases, resolver)  # type: ignore[arg-type]
+    row = result.iloc[0]
+    assert bool(row["same_vendor_name"]) is False
+    assert row["readjudication"] == "distinct_vendor_names_unverified_structure"
