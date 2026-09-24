@@ -28,7 +28,8 @@ pip install 'biomapper[benchmarks]'
 **1.5.2 is the first release on PyPI that contains the benchmark suite.** Earlier published
 releases, up to and including 1.4.0, ship neither `biomapper.benchmarks` nor the `benchmarks`
 extra, so `pip install 'biomapper[benchmarks]'` against them warns that the extra is unknown and
-installs only the core client.
+installs only the core client. The changelog records which versions reached the index; 1.5.0 and
+1.5.1 are tagged *(not published)*.
 
 ---
 
