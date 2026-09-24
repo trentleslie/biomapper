@@ -28,6 +28,7 @@ from biomapper.benchmarks.adapters.cohort_panel import (
 from biomapper.benchmarks.cross_cohort import (
     BackendDriftError,
     PanelAlignmentError,
+    arm_b_reconstruction_basis,
     assert_alignment,
     check_panel_provenance,
     client_repo_provenance,
@@ -794,3 +795,36 @@ def test_run_links_records_the_label_per_pair(tmp_path):
     )
     assert results["llfs"]["comparator_independence"]["label"] == "coverage"
     assert results["arivale"]["comparator_independence"]["label"] == "accuracy_candidate"
+
+
+# ==================================================================================================
+# The Arm-B gap is only readable next to what the reconstruction could see
+# ==================================================================================================
+
+
+def test_refmet_pair_reports_its_reconstruction_ceiling():
+    # Half the cohort standardizes, so the reconstruction cannot exceed that half. Reporting the gap
+    # to the published number without this invites reading a cache limit as a disagreement.
+    basis = arm_b_reconstruction_basis(
+        "blsa",
+        ["a", "b", "c", "d"],
+        ["a", "b", "x", "y"],
+        {"a": "A", "b": "B", "c": "C", "d": "D", "x": "X"},
+    )
+    assert basis["method"] == "refmet"
+    assert basis["necs_standardizable"] == 4 and basis["necs_n"] == 4
+    assert basis["cohort_standardizable"] == 3 and basis["cohort_n"] == 4
+    assert basis["reconstruction_ceiling"] == 3
+
+
+def test_name_match_pair_has_no_standardization_step_to_be_short_of():
+    basis = arm_b_reconstruction_basis("arivale", ["a"], ["a"], {})
+    assert basis["method"] == "name"
+    assert "no standardization step" in basis["note"]
+
+
+def test_run_links_carries_the_reconstruction_basis(tmp_path):
+    panels, curies = _link_fixture()
+    results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
+    assert results["llfs"]["arm_b_reconstruction_basis"]["method"] == "refmet"
+    assert results["arivale"]["arm_b_reconstruction_basis"]["method"] == "name"

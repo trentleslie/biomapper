@@ -66,6 +66,7 @@ from biomapper.benchmarks.scorers.arm_b_baseline import (
     MONTI_PUBLISHED,
     MONTI_PUBLISHED_PROVENANCE,
     MONTI_PUBLISHED_SUPERSEDED,
+    PAIR_METHOD,
     arm_b_overlap,
 )
 from biomapper.benchmarks.scorers.cross_cohort_overlap import (
@@ -504,6 +505,50 @@ def cross_check_harmonize(
     }
 
 
+def arm_b_reconstruction_basis(
+    cohort: str,
+    necs_names: list[str],
+    cohort_names: list[str],
+    refmet_map: dict[str, str],
+) -> dict[str, Any]:
+    """How much of each side the Arm-B reconstruction could even see.
+
+    Arm B is a controlled variable WE compute, so its gap to the published number is only
+    interpretable next to the coverage of the inputs it had. The RefMet pairs are the ones that
+    matter: a name that does not standardize is dropped before the join, exactly as in the paper, so
+    a cache that covers half a panel caps the reconstruction at half the panel. Reporting the gap as
+    a bare integer invites reading a cache limit as a disagreement with the paper.
+
+    Returns an empty basis for the CHEMICAL_NAME pairs, where the join is over raw names and
+    there is no standardization step to be short of.
+    """
+    method = PAIR_METHOD[cohort]
+    if method[0] != "refmet":
+        return {
+            "method": "name",
+            "note": "raw CHEMICAL_NAME join; no standardization step, so nothing is dropped first",
+        }
+
+    def standardizable(names: list[str]) -> int:
+        return sum(1 for n in names if refmet_map.get(n.strip(), "").strip())
+
+    cohort_ok = standardizable(cohort_names)
+    necs_ok = standardizable(necs_names)
+    return {
+        "method": "refmet",
+        "necs_standardizable": necs_ok,
+        "necs_n": len(necs_names),
+        "cohort_standardizable": cohort_ok,
+        "cohort_n": len(cohort_names),
+        "reconstruction_ceiling": min(necs_ok, cohort_ok),
+        "note": (
+            "a name that does not RefMet-standardize is dropped before the join, so the "
+            "reconstruction cannot exceed the smaller standardizable side. Read the gap to the "
+            "published number against this ceiling, not as a disagreement with the paper."
+        ),
+    }
+
+
 # Which KRAKEN-ingested source, if any, the pair's PUBLISHED comparator was built from. Monti
 # matched NECS to Arivale and to Xu on Metabolon CHEMICAL_NAME, which is vendor curation and not a
 # graph source. NECS to LLFS and to BLSA were matched on RefMet standardized names, and RefMet is
@@ -614,6 +659,9 @@ def run_links(
             "arm_m_vs_published": overlap.n_a_linked - published,
             "harmonize_cross_check": cross_check_harmonize(curies["necs"], curies[cohort]),
             "comparator_independence": comparator_independence(cohort, kg_sources),
+            "arm_b_reconstruction_basis": arm_b_reconstruction_basis(
+                cohort, necs_names, panels[cohort].names, refmet_map
+            ),
         }
         print(
             f"[pair] NECS<->{cohort}: Arm-M necs-linked={overlap.n_a_linked} "
