@@ -19,10 +19,17 @@ separates a tautomer or charge artifact from a genuinely different molecule.
 
 Outcomes, and what each licenses:
 
-``tautomer_or_charge_or_salt_artifact``
-    Both sides resolve to the same molecular formula, or to formulas differing only in hydrogen
-    count, and their masses agree within tolerance. The blocks differ because the first block is not
-    invariant to that. Not a mapping error. Do not quote it as one.
+``charge_or_protonation_artifact``
+    Identical heavy atoms with a hydrogen-count difference the mass gap confirms. A protonation
+    state, zwitterion or salt form of one compound. Not a mapping error. Do not quote it as one.
+``same_formula_different_connectivity``
+    Identical formula and mass, different first blocks. Deliberately NOT resolved: this is equally a
+    tautomer (artifact) and a constitutional isomer (real error), and composition cannot tell them
+    apart. Needs a hand check; must not be counted in either direction.
+``outside_source_hit_a_derivative``
+    One name resolved to a protected or derivatised analogue of the other. Observed live on
+    "Prolylleucine", where PubChem's name index returns Cbz-protected Z-Pro-Leu. A failure of the
+    lookup, not evidence about the link.
 ``necs_gold_suspect``
     The outside source agrees with the cohort side and disagrees with the NECS gold. This is the
     documented ~5% gold defect showing up, not a BioMapper error.
@@ -122,30 +129,82 @@ def formulas_differ_only_in_hydrogen(left: str | None, right: str | None) -> boo
     return {k: v for k, v in a.items() if k != "H"} == {k: v for k, v in b.items() if k != "H"}
 
 
-def compositions_equivalent(left: OutsideRecord, right: OutsideRecord) -> bool:
-    """True when two records describe one compound in a different protonation or tautomer form.
+def composition_relation(left: OutsideRecord, right: OutsideRecord) -> str:
+    """How two outside records' compositions relate. Returns one of:
 
-    The heavy-atom composition must match exactly. Hydrogens may differ by at most
-    :data:`MAX_HYDROGEN_DELTA`, and when both masses are known the observed mass gap must match the
-    gap that hydrogen count implies. Checking the mass against the EXPECTED difference rather than
-    against zero is the point: a protonated and a neutral record of one compound differ by very
-    close to one hydrogen mass, so demanding equal masses would reject every case this is meant
-    to catch,
-    while ignoring mass entirely would let two genuinely different compounds that happen to share a
-    heavy-atom skeleton pass as an artifact.
+    ``protonation_or_charge``
+        Identical heavy atoms, hydrogens differing by 1 to :data:`MAX_HYDROGEN_DELTA`, and a mass
+        gap matching what that hydrogen difference implies. A protonation state, a zwitterion or a
+        salt form of one compound. The first block differs because it is not invariant to that.
+    ``same_formula``
+        Identical molecular formula and mass. This is **ambiguous and must stay ambiguous.** A
+        differing first block with an identical formula is equally the signature of a tautomer (one
+        compound, an artifact of the key) and of a constitutional isomer (two compounds, a real
+        disagreement). Keto-enol tautomers share an H count; so do Pro-Leu and Leu-Pro, and leucine
+        and isoleucine. Composition cannot separate them, so this function does not pretend to.
+    ``different``
+        The compositions genuinely differ beyond a hydrogen count.
+
+    Checking the mass against the EXPECTED hydrogen gap rather than against zero is what makes the
+    protonation case detectable at all: a protonated and a neutral record differ by close to one
+    hydrogen mass, so demanding equal masses would reject every case worth catching.
     """
     a, b = _parse_formula(left.formula), _parse_formula(right.formula)
     if a is None or b is None:
-        return False
+        return "different"
     if {k: v for k, v in a.items() if k != "H"} != {k: v for k, v in b.items() if k != "H"}:
-        return False
+        return "different"
     hydrogen_delta = abs(a.get("H", 0) - b.get("H", 0))
+    if hydrogen_delta == 0:
+        return "same_formula"
     if hydrogen_delta > MAX_HYDROGEN_DELTA:
+        return "different"
+    if left.mass is None or right.mass is None:
+        return "protonation_or_charge"  # formula-only evidence; the rationale says so
+    expected_gap = hydrogen_delta * HYDROGEN_MASS_DA
+    if abs(abs(left.mass - right.mass) - expected_gap) <= MASS_TOLERANCE_DA:
+        return "protonation_or_charge"
+    return "different"
+
+
+# A name lookup that returns a protected or derivatised analogue instead of the parent compound is a
+# real, observed failure of the outside source, not a structural disagreement. Seen live: PubChem's
+# name index for "Prolylleucine" returns CID 3584406, the Cbz-protected Z-Pro-Leu (C19H26N2O5,
+# 362.18 Da), while the free dipeptide is CID 3527720 (C11H20N2O3, 228.15 Da). A certificate that
+# trusts the name hit marks a CORRECT mapping as contradicted.
+#
+# Detector: one formula's heavy-atom counts contain the other's, with a large mass gap. Deliberately
+# conservative on both conditions, because a true wrong-molecule call must not be excused.
+DERIVATIVE_MASS_GAP_DA = 50.0
+
+
+def formula_contains(larger: str | None, smaller: str | None) -> bool:
+    """True when every heavy-atom count in ``smaller`` is present in ``larger``, and it is strictly
+    bigger. The signature of a protecting group or a conjugate, rather than a different skeleton."""
+    big, small = _parse_formula(larger), _parse_formula(smaller)
+    if big is None or small is None:
+        return False
+    big_heavy = {k: v for k, v in big.items() if k != "H"}
+    small_heavy = {k: v for k, v in small.items() if k != "H"}
+    if not small_heavy or big_heavy == small_heavy:
+        return False
+    return all(
+        big_heavy.get(element, 0) >= count for element, count in small_heavy.items()
+    ) and any(big_heavy.get(element, 0) > count for element, count in small_heavy.items())
+
+
+def suspected_derivative(left: OutsideRecord, right: OutsideRecord) -> bool:
+    """True when one record looks like a derivatised analogue of the other rather than a rival
+    structure. Requires BOTH a containing formula and a mass gap, so an isomer never qualifies."""
+    if not left.resolved or not right.resolved:
         return False
     if left.mass is None or right.mass is None:
-        return True  # formula-only evidence; stated as such by the caller's rationale
-    expected_gap = hydrogen_delta * HYDROGEN_MASS_DA
-    return abs(abs(left.mass - right.mass) - expected_gap) <= MASS_TOLERANCE_DA
+        return False
+    if abs(left.mass - right.mass) < DERIVATIVE_MASS_GAP_DA:
+        return False
+    return formula_contains(left.formula, right.formula) or formula_contains(
+        right.formula, left.formula
+    )
 
 
 class OutsideResolver:
@@ -254,13 +313,34 @@ def classify(
                 "the outside source backs both sides at the SAME structure, so this case was not a "
                 "structural disagreement and its refusal came from somewhere else",
             )
-        if compositions_equivalent(outside_necs, outside_cohort):
+        relation = composition_relation(outside_necs, outside_cohort)
+        if relation == "protonation_or_charge":
             return (
-                "tautomer_or_charge_or_salt_artifact",
-                f"the outside source corroborates both sides, and they share a heavy-atom "
-                f"composition ({outside_necs.formula} vs {outside_cohort.formula}) with a mass gap "
-                f"consistent with a hydrogen count difference. The InChIKey first blocks differ "
-                f"because the first block is not invariant to tautomer, protonation or salt form",
+                "charge_or_protonation_artifact",
+                f"the outside source corroborates both sides, they share a heavy-atom composition "
+                f"({outside_necs.formula} vs {outside_cohort.formula}), and the mass gap matches "
+                "the hydrogen-count difference. That is a protonation, zwitterion or salt form of "
+                "one compound; the InChIKey first block is not invariant to it",
+            )
+        if relation == "same_formula":
+            return (
+                "same_formula_different_connectivity",
+                f"both sides resolve to {outside_necs.formula} at the same mass but to different "
+                "InChIKey first blocks. That is EQUALLY the signature of a tautomer, which would "
+                "make this an artifact, and of a constitutional isomer, which would make the link "
+                "genuinely wrong. Leucine against isoleucine and Pro-Leu against Leu-Pro both live "
+                "here. Composition cannot separate the two, so this needs a hand check and must "
+                "not be counted in either direction",
+            )
+        if suspected_derivative(outside_necs, outside_cohort):
+            return (
+                "outside_source_hit_a_derivative",
+                f"one side's name resolved to what looks like a derivatised analogue of the other "
+                f"({outside_necs.formula} vs {outside_cohort.formula}, a mass gap of "
+                f"{abs((outside_necs.mass or 0) - (outside_cohort.mass or 0)):.1f} Da with a "
+                "containing formula). PubChem's name index ranks protected forms above free "
+                "compounds for peptide names, so this is a failure of the outside lookup, not "
+                "evidence that the link is wrong. Nothing is concluded about the link",
             )
         return (
             "genuine_structural_disagreement",

@@ -12,8 +12,11 @@ from biomapper.benchmarks.cross_cohort_readjudicate import (
     OutsideRecord,
     OutsideResolver,
     classify,
+    composition_relation,
+    formula_contains,
     formulas_differ_only_in_hydrogen,
     readjudicate,
+    suspected_derivative,
 )
 
 GLUCOSE = "WQZGKKKJIJFFOK"
@@ -60,15 +63,37 @@ def test_unparseable_formula_never_buys_a_free_pass():
 # ==================================================================================================
 
 
-def test_same_composition_with_different_blocks_is_an_artifact_not_an_error():
+def test_a_protonation_difference_is_an_artifact_not_an_error():
     outcome, rationale = classify(
         GLUCOSE,
         OTHER,
         _hit(GLUCOSE, "C6H12O6", 180.0634),
         _hit(OTHER, "C6H13O6", 181.0712),
     )
-    assert outcome == "tautomer_or_charge_or_salt_artifact"
+    assert outcome == "charge_or_protonation_artifact"
     assert "not invariant" in rationale
+
+
+def test_identical_formula_with_different_blocks_stays_ambiguous():
+    # A tautomer and a constitutional isomer are indistinguishable by composition, so neither is
+    # claimed. Counting this as an artifact would excuse real wrong-molecule links.
+    outcome, rationale = classify(
+        GLUCOSE,
+        OTHER,
+        _hit(GLUCOSE, "C6H12O6", 180.0634),
+        _hit(OTHER, "C6H12O6", 180.0634),
+    )
+    assert outcome == "same_formula_different_connectivity"
+    assert "must not be counted in either direction" in rationale
+
+
+def test_composition_relation_classifies_the_three_cases():
+    same = _hit(GLUCOSE, "C6H12O6", 180.0634)
+    protonated = _hit(OTHER, "C6H13O6", 180.0634 + 1.007825)
+    unrelated = _hit(THIRD, "C9H8O4", 180.0423)
+    assert composition_relation(same, _hit(OTHER, "C6H12O6", 180.0634)) == "same_formula"
+    assert composition_relation(same, protonated) == "protonation_or_charge"
+    assert composition_relation(same, unrelated) == "different"
 
 
 def test_outside_source_backing_the_cohort_implicates_the_gold():
@@ -130,7 +155,7 @@ def test_mass_disagreement_blocks_the_artifact_call():
         _hit(GLUCOSE, "C6H12O6", 180.0634),
         _hit(OTHER, "C6H12O6", 200.0),
     )
-    assert outcome != "tautomer_or_charge_or_salt_artifact"
+    assert outcome != "charge_or_protonation_artifact"
 
 
 # ==================================================================================================
@@ -237,3 +262,44 @@ def test_outside_resolver_parses_a_single_hit():
 def test_outside_resolver_reports_a_malformed_body_as_a_failure_not_a_miss():
     assert OutsideResolver._parse("not json").status == "lookup_failed"
     assert OutsideResolver._parse('{"PropertyTable": {"Properties": []}}').status == "clean_miss"
+
+
+# ==================================================================================================
+# The outside source returning a derivative instead of the parent (observed live)
+# ==================================================================================================
+
+# PubChem's name index for "Prolylleucine" returns the Cbz-protected Z-Pro-Leu rather than the free
+# dipeptide, which made the API certificate mark a CORRECT mapping as contradicted.
+PRO_LEU = _hit("ZKQOUHVVXABNDG", "C11H20N2O3", 228.14739250)  # CID 3527720, free dipeptide
+Z_PRO_LEU = _hit("YCYXUKRYYSXSLJ", "C19H26N2O5", 362.18417193)  # CID 3584406, Cbz-protected
+LEU_PRO = _hit("VTJUNIYRYIAIHF", "C11H20N2O3", 228.14739250)  # the reverse dipeptide, a real isomer
+
+
+def test_formula_containment_detects_a_protecting_group():
+    assert formula_contains("C19H26N2O5", "C11H20N2O3") is True
+    assert formula_contains("C11H20N2O3", "C19H26N2O5") is False
+    # Identical skeletons are not containment, and neither is a rival skeleton.
+    assert formula_contains("C11H20N2O3", "C11H20N2O3") is False
+    assert formula_contains("C11H20N2O3", "C9H8O4") is False
+
+
+def test_the_observed_prolylleucine_pair_is_called_a_derivative_not_a_disagreement():
+    assert suspected_derivative(PRO_LEU, Z_PRO_LEU) is True
+    outcome, rationale = classify("ZKQOUHVVXABNDG", "YCYXUKRYYSXSLJ", PRO_LEU, Z_PRO_LEU)
+    assert outcome == "outside_source_hit_a_derivative"
+    assert "not evidence that the link is wrong" in rationale
+
+
+def test_a_true_isomer_is_never_excused_as_a_derivative():
+    # Pro-Leu against Leu-Pro: same formula, same mass, different connectivity. A real disagreement.
+    assert suspected_derivative(PRO_LEU, LEU_PRO) is False
+    outcome, rationale = classify("ZKQOUHVVXABNDG", "VTJUNIYRYIAIHF", PRO_LEU, LEU_PRO)
+    # Same formula, different connectivity. Not excused as an artifact, and not asserted to be a
+    # wrong molecule either: composition cannot tell a tautomer from a constitutional isomer.
+    assert outcome == "same_formula_different_connectivity"
+    assert "Pro-Leu against Leu-Pro" in rationale
+
+
+def test_a_small_mass_gap_is_not_enough_for_the_derivative_call():
+    near = _hit("AAAAAAAAAAAAAA", "C12H22N2O3", 242.16)  # containing formula, only 14 Da apart
+    assert suspected_derivative(PRO_LEU, near) is False
