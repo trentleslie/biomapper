@@ -49,6 +49,7 @@ from biomapper.benchmarks.cross_cohort import (
     sha256_path,
 )
 from biomapper.benchmarks.scorers.cross_cohort_overlap import Link
+from biomapper.benchmarks.scorers.gold_structure import has_gold_structure
 from biomapper.benchmarks.scorers.independent_inchikey import ProvidedBlock
 from biomapper.benchmarks.scorers.independent_link_certificate_overlap import (
     certify_links_tagged,
@@ -83,18 +84,34 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
 
     A row with no curated key yields no entry, which makes any link through it ``refused`` rather
     than certified off nothing.
+
+    Every candidate value is screened with
+    :func:`biomapper.benchmarks.scorers.gold_structure.has_gold_structure`, which rejects blanks and
+    the documented corrupt ``4000`` placeholder. Without the screen a sentinel is a 4-character
+    "block" that can never equal a real 14-character one, so every link through that row comes back
+    REFUTED, and a refuted verdict reads as a wrong molecule rather than as a broken gold cell. The
+    MOESM5 supplement carries ``4000`` on 10 rows; 9 of them also carry a usable standard key, so
+    exactly one row reaches the block set unscreened. One spurious refutation in a hand-adjudicated
+    set is one wrong published claim.
     """
     raw = moesm5.read_bytes()
     bundle = load_necs(raw)
     frame = bundle.input_df
     blocks: dict[str, ProvidedBlock] = {}
     both_present = agree = 0
+    rejected: dict[str, int] = {}
     for _, row in frame.iterrows():
         name = str(row.get("chemical_name", "")).strip()
         if not name:
             continue
-        standard = first_block(str(row.get("gold_inchikey_standard", "")).strip() or None)
-        legacy = first_block(str(row.get("gold_inchikey", "")).strip() or None)
+        raw_standard = str(row.get("gold_inchikey_standard", "")).strip()
+        raw_legacy = str(row.get("gold_inchikey", "")).strip()
+        for candidate in (raw_standard, raw_legacy):
+            if candidate and not has_gold_structure(candidate):
+                rejected[candidate] = rejected.get(candidate, 0) + 1
+        # Screened BEFORE first_block: a corrupt cell must not become a comparable block.
+        standard = first_block(raw_standard) if has_gold_structure(raw_standard) else None
+        legacy = first_block(raw_legacy) if has_gold_structure(raw_legacy) else None
         if standard and legacy:
             both_present += 1
             agree += int(standard == legacy)
@@ -118,6 +135,14 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
             "agree": agree,
             "disagree": both_present - agree,
         },
+        "rejected_gold_values": rejected,
+        "n_rows_rejected_for_corrupt_gold": sum(rejected.values()),
+        "screen": (
+            "candidate keys screened with gold_structure.has_gold_structure, which rejects blanks "
+            "and the corrupt '4000' placeholder. An unscreened sentinel becomes a 4-character "
+            "block that can never match a real one, so every link through that row returns "
+            "REFUTED and reads as a wrong molecule rather than a broken gold cell."
+        ),
         "known_defect": (
             "the NECS curated gold carries roughly 5% InChIKey errors, so a disagreement "
             "with it is "

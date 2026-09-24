@@ -290,3 +290,65 @@ def test_certify_refuses_a_link_file_that_disagrees_with_its_manifest(tmp_path, 
 def test_certify_requires_a_manifest(tmp_path):
     run = _run_dir(tmp_path, write_manifest=False)
     assert certify_module.main(["--run-dir", str(run)]) == 2
+
+
+# ==================================================================================================
+# A corrupt gold cell must not become a comparable block
+# ==================================================================================================
+
+
+def _moesm5_with_corrupt_sentinel(path: Path) -> None:
+    """The documented corrupt '4000' placeholder, in both vintages and in each alone."""
+    pd.DataFrame(
+        {
+            "CHEMICAL_NAME": ["clean", "both_corrupt", "legacy_corrupt_standard_ok", "blank"],
+            "INCHIKEY": [
+                "WQZGKKKJIJFFOK-UHFFFAOYAK",
+                "4000",
+                "4000",
+                "",
+            ],
+            "inchi_key": [
+                "WQZGKKKJIJFFOK-GASJEMHNSA-N",
+                "4000",
+                "MFYSYFVPBJMHGN-ZPOLXVRWSA-N",
+                "",
+            ],
+        }
+    ).to_excel(path, index=False)
+
+
+def test_the_corrupt_sentinel_never_becomes_a_block(tmp_path):
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    blocks, card = necs_gold_blocks(path)
+
+    # Unscreened, "4000" would be a 4-character block that can never equal a real 14-character one,
+    # so every link through this row would come back REFUTED and read as a wrong molecule.
+    assert "both_corrupt" not in blocks
+    assert blocks["clean"].block == "WQZGKKKJIJFFOK"
+    # A row whose legacy cell is corrupt but whose standard cell is usable still contributes.
+    assert blocks["legacy_corrupt_standard_ok"].block == "MFYSYFVPBJMHGN"
+    assert "blank" not in blocks
+
+
+def test_rejected_gold_values_are_counted_not_silently_dropped(tmp_path):
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    _blocks, card = necs_gold_blocks(path)
+    # Three corrupt cells across two rows: both vintages on one, the legacy vintage on another.
+    assert card["rejected_gold_values"] == {"4000": 3}
+    assert card["n_rows_rejected_for_corrupt_gold"] == 3
+    assert "REFUTED" in card["screen"]
+
+
+def test_a_corrupt_row_does_not_inflate_the_two_vintage_agreement(tmp_path):
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    _blocks, card = necs_gold_blocks(path)
+    # Only "clean" has two usable vintages; the corrupt row must not count as an agreement.
+    assert card["two_vintage_first_block_agreement"] == {
+        "both_present": 1,
+        "agree": 1,
+        "disagree": 0,
+    }
