@@ -444,13 +444,10 @@ class ApiMapper:
         if not mismatches:
             return
         raise BatchOrderMismatchError(
-            f"the API returned {len(mismatches)} of {len(chunk)} batch result(s) out of order, and "
             f"the API returned {len(mismatches)} of {len(chunk)} batch result(s) out of order,"
             f" and predictions are joined to the held-out gold BY POSITION — so scoring this"
             f" batch would compare each prediction against another entity's gold. Refusing the"
             f" arm. First mismatch: {mismatches[0]}"
-            f"compare each prediction against another entity's gold. Refusing the arm. "
-            f"First mismatch: {mismatches[0]}"
         )
 
     def _record_transport_error(self, exc: Exception) -> None:
@@ -510,6 +507,17 @@ class ApiMapper:
                 row[f"lipid_{name}"] = getattr(lipid, name, None) if lipid is not None else None
             prediction_rows.append(row)
 
+        # Backstop, not a currently-reachable path: the client emits the mismatch as a WARNING and
+        # still appends a normal result, so today it is always caught in `_map_chunk`.
+        #
+        # Reaching this check needs BOTH of two things at once, not either alone. Parallelizing
+        # chunk mapping alone is not enough: under ordinary warning settings the client still
+        # appends a normal result and never populates `error`. A global warnings-as-errors setting
+        # alone is not enough either: the `simplefilter("always")` inside our own
+        # `catch_warnings` block overrides it. It takes parallel mapping AND warnings raised as
+        # errors — then one task's filter state can leak into another's `map_entities` call, the
+        # warning raises inside the client's broad `except`, and it lands as a per-record error.
+        # Narrow, but cheap to guard, and the alternative is a silently mis-scored arm.
         order_errors = [
             r.error for r in results if r.error and "Batch order mismatch" in r.error
         ]

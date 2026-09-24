@@ -49,7 +49,7 @@ from biomapper.benchmarks.config import (
 )
 from biomapper.benchmarks.oracle import ApiStructureOracle, NodeNameResolver
 from biomapper.benchmarks.provenance import RunProvenance
-from biomapper.benchmarks.runner import run_all, run_provided_id, run_vocab
+from biomapper.benchmarks.runner import VocabRun, run_all, run_provided_id, run_vocab
 from biomapper.benchmarks.scorers.curie_scorer import score_curie
 from biomapper.benchmarks.scorers.structure_oracle_scorer import (
     neutralize_first_block,
@@ -110,8 +110,8 @@ def _build_oracle(
 
 
 def require_complete_union(
-    runs: dict[str, Any], *, key: str, target_vocabs: tuple[str, ...]
-) -> list[Any]:
+    runs: dict[str, VocabRun], *, key: str, target_vocabs: tuple[str, ...]
+) -> list[VocabRun]:
     """Return every vocab pass, refusing the arm if any of them failed.
 
     For a metric defined as "resolved in ANY target vocabulary", a missing pass can only turn real
