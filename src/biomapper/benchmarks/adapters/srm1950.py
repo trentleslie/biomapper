@@ -33,13 +33,13 @@ _ACCESSION_DIGITS = re.compile(r"(\d+)")
 
 
 class RowIndexGoldColumnError(ValueError):
-    """A gold accession column whose values are really the row number.
+    """A CONFIGURED GOLD column whose values are really the row number.
 
-    The delivery's identifier column ran in file order, one value per row, with the numeric parts
-    forming the sequence one to n against chemically unrelated names. It has an accession's exact
-    format, so it reads as gold to anything that greps for one, and the identifier-based coverage
-    figure derived from it was an artefact of the synthetic column rather than a resolver result.
-    The run refuses it at acquisition rather than scoring against it.
+    Raised only when the synthetic column would actually feed a reported figure, because then any
+    score computed from the delivery is a score against invented values. A synthetic column that
+    feeds nothing is dropped instead: see :func:`screen_row_index_columns`. Refusing an arm over an
+    unused column discards a working benchmark, which is a worse outcome than the one this guard
+    exists to prevent.
     """
 
 
@@ -63,10 +63,33 @@ def fetch_supplement(url: str, *, timeout: float = 60.0) -> bytes:
     return resp.content
 
 
+#: Literal strings the delivery uses to mean "no value". ``#N/A`` is an Excel error escaping into
+#: the export, and it appears in the SMILES column on 24 rows. Pandas would silently coerce it to
+#: NaN under its default ``na_values``, which is the right outcome but an invisible one: the row
+#: count would drop with no record of why. These are recognised explicitly so a missing-data
+#: sentinel is reported as a sentinel and not as chemistry that failed to parse. Same class of
+#: defect as the NECS ``4000`` gold sentinel.
+MISSING_SENTINELS: frozenset[str] = frozenset(
+    {"#N/A", "#NA", "N/A", "NA", "NULL", "NONE", "-", "."}
+)
+
+
 def parse_csv(raw: bytes) -> pd.DataFrame:
-    """Parse the delivery bytes into a raw DataFrame (all cells as strings, blanks preserved)."""
+    """Parse the delivery bytes into a raw DataFrame (all cells as literal strings).
+
+    ``keep_default_na=False`` on purpose: pandas' default NA coercion would turn the delivery's
+    ``#N/A`` sentinels into NaN before anything could count them, so a reader of the dataset card
+    would see a smaller denominator with no explanation. Read everything literally, then classify
+    explicitly in :func:`gold_structure_exclusions`.
+    """
     text = raw.decode("utf-8-sig")
-    return pd.read_csv(io.StringIO(text), dtype=str).fillna("")
+    return pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False).fillna("")
+
+
+def is_missing(value: Any) -> bool:
+    """True when a cell is blank or one of the delivery's missing-data sentinels."""
+    text = _norm(value)
+    return not text or text.upper() in MISSING_SENTINELS
 
 
 def _norm(value: Any) -> str:
@@ -127,23 +150,106 @@ def is_row_index_column(values: Any) -> bool:
     return parsed == list(range(1, len(parsed) + 1))
 
 
-def _refuse_row_index_gold_columns(raw_df: pd.DataFrame) -> None:
-    """Fail the run loudly when the delivery ships an accession column that is a row index.
+def screen_row_index_columns(
+    raw_df: pd.DataFrame, config: DatasetConfig = SRM1950
+) -> dict[str, Any]:
+    """Drop a synthetic accession column, or refuse the run if it would feed a reported figure.
 
-    Complements (and does not replace) the generic uniqueness-and-monotonicity quarantine that
-    handles *unknown* columns: this one refuses a known-bad column outright at acquisition, before
-    any figure can be computed from it.
+    The delivery's ``HMDB_ID`` runs ``HMDB0000001..HMDB0001058``, one value per row in file order,
+    against chemically unrelated names: cholic acid is listed as ``HMDB0000001`` when its real
+    accession is ``HMDB0000619``. It has an accession's exact format, so it reads as gold to
+    anything that greps for one.
+
+    Dropping is the right response here, not refusing. This column feeds nothing that is reported:
+    SRM1950's ``gold_coverage_columns`` are INCHIKEY and SMILES, and the structure oracle is the
+    InChIKey derived from the certified SMILES, which never read it. Refusing the whole arm over an
+    unused column threw away a scoreable independent accuracy benchmark, which is a worse outcome
+    than the one the guard existed to prevent.
+
+    The refusal is kept for the case that actually warrants it: a row-index column that IS a
+    configured gold column, where scoring would silently run against synthetic values. That is the
+    failure the guard was written for, and it stays fatal.
+
+    Returns a report for the dataset card, so a reader can see the column was found and dropped
+    rather than silently absent.
     """
+    report: dict[str, Any] = {"dropped_columns": [], "reason": None}
     hmdb_raw = _resolve_column(raw_df, HMDB_CANDIDATES)
     if hmdb_raw is None:
-        return
-    if is_row_index_column(raw_df[hmdb_raw].tolist()):
+        return report
+    if not is_row_index_column(raw_df[hmdb_raw].tolist()):
+        return report
+
+    reason = (
+        f"{hmdb_raw!r} is a row index wearing an accession's format: its numeric parts are "
+        f"unique, monotonic, and exactly the consecutive sequence starting at one over all rows. "
+        f"Dropped at acquisition; it is never emitted as a query, a gold value, or a coverage "
+        f"column, so no reported figure is computed from it."
+    )
+
+    gold_columns = {column for _namespace, column in config.gold_coverage_columns}
+    gold_columns.update({config.gold_inchikey_column, config.gold_smiles_column or ""})
+    if hmdb_raw in gold_columns:
         raise RowIndexGoldColumnError(
-            f"{hmdb_raw!r} in the delivery is a row index wearing an accession's format: its "
-            f"numeric parts are unique, monotonic, and exactly the consecutive sequence starting "
-            f"at one over all rows. Refusing to build the input rather than scoring coverage "
-            f"against a synthetic gold column."
+            f"{reason} It is ALSO a configured gold column for {config.key}, so a score computed "
+            f"from this delivery would be a score against synthetic values. Refusing the run."
         )
+
+    report["dropped_columns"] = [hmdb_raw]
+    report["reason"] = reason
+    return report
+
+
+def gold_structure_exclusions(
+    raw_df: pd.DataFrame, config: DatasetConfig = SRM1950
+) -> dict[str, Any]:
+    """Account for every row that yields no gold structure, with the reason it does not.
+
+    Two distinct causes, kept apart because they mean different things: a row that ships no SMILES
+    at all (the delivery is incomplete for it) and a row whose SMILES is present but will not parse
+    (the delivery is wrong for it). Collapsing them into one "missing" count hides a data-quality
+    signal, and reporting neither would let the accuracy denominator shrink silently.
+    """
+    smiles_raw = _resolve_column(raw_df, SMILES_CANDIDATES)
+    inchikey_raw = _resolve_column(raw_df, INCHIKEY_CANDIDATES)
+    n = len(raw_df)
+    smiles = raw_df[smiles_raw].map(_norm) if smiles_raw is not None else pd.Series([""] * n)
+    explicit = raw_df[inchikey_raw].map(_norm) if inchikey_raw is not None else pd.Series([""] * n)
+    names = raw_df[_resolve_column(raw_df, QUERY_CANDIDATES) or raw_df.columns[0]].map(_norm)
+
+    blank, sentinel, unparseable = [], [], []
+    for name, ik, sm in zip(names.values, explicit.values, smiles.values):
+        if not is_missing(ik):
+            continue
+        text = _norm(sm)
+        if not text:
+            blank.append(name)
+        elif text.upper() in MISSING_SENTINELS:
+            sentinel.append(name)
+        elif not inchikey_from_smiles(text):
+            unparseable.append(name)
+    excluded = len(blank) + len(sentinel) + len(unparseable)
+    return {
+        "n_rows": n,
+        # Split deliberately. A naive "empty string" check sees only the blanks and reports 51
+        # exclusions; the true figure is 75, because 24 further rows carry an ``#N/A`` sentinel
+        # that is text, not a structure. Reporting one number would understate the gap by a third.
+        "n_excluded_blank_smiles": len(blank),
+        "n_excluded_sentinel_smiles": len(sentinel),
+        "n_excluded_unparseable_smiles": len(unparseable),
+        "n_excluded_total": excluded,
+        "n_scorable": n - excluded,
+        "excluded_blank_smiles": blank,
+        "excluded_sentinel_smiles": sentinel,
+        "excluded_unparseable_smiles": unparseable,
+        "reason": (
+            "the delivery's INCHIKEY column is empty on every row, so the gold structure is "
+            "derived from the certified SMILES with RDKit. A row whose SMILES is blank, is a "
+            "missing-data sentinel such as '#N/A', or does not parse, yields no gold structure "
+            "and is excluded from the accuracy denominator rather than counted as a miss. "
+            "Counting a structureless row as a miss would report a data gap as a resolver error."
+        ),
+    }
 
 
 def build_input_df(raw_df: pd.DataFrame, config: DatasetConfig = SRM1950) -> pd.DataFrame:
@@ -161,17 +267,26 @@ def build_input_df(raw_df: pd.DataFrame, config: DatasetConfig = SRM1950) -> pd.
         )
     smiles_raw = _resolve_column(raw_df, SMILES_CANDIDATES)
     inchikey_raw = _resolve_column(raw_df, INCHIKEY_CANDIDATES)
-    _refuse_row_index_gold_columns(raw_df)
+    screen_row_index_columns(raw_df, config)
 
     out = pd.DataFrame()
     out[config.name_column] = raw_df[query_raw].map(_norm)
-    smiles = raw_df[smiles_raw].map(_norm) if smiles_raw is not None else pd.Series([""] * len(raw_df))
-    explicit_ik = raw_df[inchikey_raw].map(_norm) if inchikey_raw is not None else pd.Series([""] * len(raw_df))
+    smiles = (
+        raw_df[smiles_raw].map(_norm) if smiles_raw is not None else pd.Series([""] * len(raw_df))
+    )
+    explicit_ik = (
+        raw_df[inchikey_raw].map(_norm)
+        if inchikey_raw is not None
+        else pd.Series([""] * len(raw_df))
+    )
     assert config.gold_smiles_column is not None  # SRM1950 config carries a gold SMILES column
     out[config.gold_smiles_column] = smiles.values
     # Prefer an explicit delivery InChIKey; otherwise derive from the certified SMILES.
     out[config.gold_inchikey_column] = [
-        ik if ik else inchikey_from_smiles(sm) for ik, sm in zip(explicit_ik.values, smiles.values)
+        ""
+        if is_missing(ik) and is_missing(sm)
+        else (ik if not is_missing(ik) else inchikey_from_smiles(sm))
+        for ik, sm in zip(explicit_ik.values, smiles.values)
     ]
     # The delivery's identifier column is NOT emitted. See ``RowIndexGoldColumnError``: it was a row
     # index in accession clothing, and a quarantined-but-present gold column is a trap for the next
@@ -179,6 +294,19 @@ def build_input_df(raw_df: pd.DataFrame, config: DatasetConfig = SRM1950) -> pd.
     # InChIKey, which never read this column, so accuracy is unaffected by the drop.
     out[HAS_STRUCTURE_COL] = out[config.gold_inchikey_column].map(lambda s: bool(_norm(s)))
     return out
+
+
+def parsed_gold_sha256(input_df: pd.DataFrame, config: DatasetConfig = SRM1950) -> str:
+    """SHA of the parsed gold structures, so the scored subset is reproducible.
+
+    Hashes the name plus the derived gold InChIKey, sorted by name and serialized without an index,
+    so the digest depends on the gold content and not on row order or pandas formatting defaults.
+    Separate from the delivery SHA: the delivery pins what arrived, this pins what was scored, and
+    an RDKit or adapter change moves this one while leaving the delivery digest untouched.
+    """
+    columns = [config.name_column, config.gold_inchikey_column]
+    frame = input_df[columns].sort_values(config.name_column, kind="stable")
+    return hashlib.sha256(frame.to_csv(index=False).encode()).hexdigest()
 
 
 def build_card(
@@ -205,6 +333,16 @@ def build_card(
         # Load-bearing provenance: the delivery's InChIKey column is empty, so the oracle InChIKey
         # is derived from the certified SMILES (recorded so a reviewer knows the oracle's origin).
         "structure_oracle_source": "derived_from_certified_smiles",
+        # The SHA of the PARSED gold, not of the delivery. The delivery's SHA pins the bytes that
+        # arrived; this pins the gold structures actually scored against, which is what another
+        # run has to reproduce. They are different artifacts and a reader needs both.
+        "parsed_gold_sha256": parsed_gold_sha256(input_df, config),
+        # Which delivery columns were dropped as synthetic, and why. Recorded rather than silently
+        # omitted so the absence of an identifier column is visibly a decision, not an oversight.
+        "screened_columns": screen_row_index_columns(raw_df, config),
+        # Rows carrying no derivable gold structure, split by cause. The accuracy denominator is
+        # n_scorable, not n_rows; stating only the former would make the exclusions invisible.
+        "gold_structure_exclusions": gold_structure_exclusions(raw_df, config),
         "source_doi": config.source_doi,
         "source_url": config.source_url,
         "source_sha256": source_sha,
@@ -218,7 +356,9 @@ class SRM1950Bundle:
     card: dict[str, Any]
 
 
-def load_srm1950(source: bytes | str | pd.DataFrame, config: DatasetConfig = SRM1950) -> SRM1950Bundle:
+def load_srm1950(
+    source: bytes | str | pd.DataFrame, config: DatasetConfig = SRM1950
+) -> SRM1950Bundle:
     """Load SRM1950 from raw CSV bytes (SHA pinned), a URL (fetched), or a DataFrame (tests).
 
     When ``source`` is a DataFrame the card's ``source_sha256`` is computed over its canonical CSV
@@ -237,4 +377,6 @@ def load_srm1950(source: bytes | str | pd.DataFrame, config: DatasetConfig = SRM
         raise TypeError(f"unsupported source type {type(source)!r}")
 
     sha = sha256_bytes(raw_bytes)
-    return SRM1950Bundle(input_df=build_input_df(raw_df, config), card=build_card(raw_df, sha, config))
+    return SRM1950Bundle(
+        input_df=build_input_df(raw_df, config), card=build_card(raw_df, sha, config)
+    )
