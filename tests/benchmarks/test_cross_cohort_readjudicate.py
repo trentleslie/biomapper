@@ -303,3 +303,43 @@ def test_a_true_isomer_is_never_excused_as_a_derivative():
 def test_a_small_mass_gap_is_not_enough_for_the_derivative_call():
     near = _hit("AAAAAAAAAAAAAA", "C12H22N2O3", 242.16)  # containing formula, only 14 Da apart
     assert suspected_derivative(PRO_LEU, near) is False
+
+
+# ==================================================================================================
+# An artifact call must never rest on evidence that was not obtained
+# ==================================================================================================
+
+
+def test_a_hydrogen_difference_without_a_mass_is_not_called_an_artifact():
+    no_mass = OutsideRecord(block=OTHER, formula="C6H13O6", mass=None, status="success")
+    assert composition_relation(_hit(GLUCOSE, "C6H12O6", 180.0634), no_mass) == (
+        "hydrogen_difference_unverified"
+    )
+    outcome, rationale = classify(GLUCOSE, OTHER, _hit(GLUCOSE, "C6H12O6", 180.0634), no_mass)
+    assert outcome == "outside_source_unresolved"
+    assert "could not be confirmed" in rationale
+    # The old behaviour would have claimed a matching mass gap it never measured.
+    assert "mass gap matches" not in rationale
+
+
+def test_a_hydrogen_difference_with_the_wrong_mass_gap_is_a_real_difference():
+    # Same heavy atoms, one hydrogen apart on paper, but the masses are 20 Da apart. Not a
+    # protonation state.
+    outcome, _ = classify(
+        GLUCOSE,
+        OTHER,
+        _hit(GLUCOSE, "C6H12O6", 180.0634),
+        _hit(OTHER, "C6H13O6", 200.0),
+    )
+    assert outcome == "genuine_structural_disagreement"
+
+
+def test_a_confirmed_hydrogen_gap_is_still_called_an_artifact():
+    outcome, rationale = classify(
+        GLUCOSE,
+        OTHER,
+        _hit(GLUCOSE, "C6H12O6", 180.0634),
+        _hit(OTHER, "C6H13O6", 180.0634 + 1.007825),
+    )
+    assert outcome == "charge_or_protonation_artifact"
+    assert "mass gap matches" in rationale

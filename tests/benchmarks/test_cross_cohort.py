@@ -13,6 +13,7 @@ Fully offline. No network, no mapper, no knowledge graph.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -36,7 +37,9 @@ from biomapper.benchmarks.cross_cohort import (
     cross_check_harmonize,
     curies_by_name,
     errored_names,
+    prepare_panel,
     repair_errored_rows,
+    resolve_panel,
     run_links,
     write_panel_provenance,
 )
@@ -842,3 +845,97 @@ def test_sidecar_flags_a_late_client_capture_rather_than_passing_it_off(tmp_path
     # tree then would attribute the panel to whatever the repo has become, so the fallback says so.
     record = write_panel_provenance(tmp_path, "necs", _provenance())
     assert record["client_repo"]["captured"] == "late (at sidecar write)"
+
+
+# ==================================================================================================
+# Ordering: a rejected checkpoint must be left exactly as it was found
+# ==================================================================================================
+
+
+def _checkpoint(out_dir: Path, label: str, names: list[str], error_on: str | None = None) -> None:
+    pd.DataFrame(
+        {
+            "name": names,
+            "chosen_kg_id": ["CHEBI:1" for _ in names],
+            "kg_equivalent_ids": ["{}" for _ in names],
+            "mapping_error": ["503 Server Error" if n == error_on else "" for n in names],
+        }
+    ).to_csv(out_dir / f"{label}_MAPPED.tsv", sep="\t", index=False)
+
+
+def test_a_drifting_checkpoint_is_rejected_before_the_repair_pass_can_rewrite_it(tmp_path):
+    names = ["glucose", "urea"]
+    _checkpoint(tmp_path, "necs", names, error_on="urea")
+    before = (tmp_path / "necs_MAPPED.tsv").read_bytes()
+    write_panel_provenance(tmp_path, "necs", _provenance(kg_version="2.1.0"), {"commit": "a" * 40})
+    mapper = _StubMapper({"urea": {"chosen_kg_id": "CHEBI:16199", "kg_equivalent_ids": "{}"}})
+
+    with pytest.raises(BackendDriftError):
+        prepare_panel(
+            mapper,
+            _panel(names, "necs"),
+            tmp_path,
+            "necs",
+            _provenance(kg_version="2.1.1"),
+            {"commit": "a" * 40},
+            allow_unpinned=False,
+        )
+    # The repair pass never ran, so the checkpoint still holds only the original backend's rows.
+    # Rewriting it first and aborting second would have left a two-backend file for a later retry.
+    assert mapper.requested == []
+    assert (tmp_path / "necs_MAPPED.tsv").read_bytes() == before
+
+
+def test_a_matching_checkpoint_is_repaired(tmp_path):
+    names = ["glucose", "urea"]
+    _checkpoint(tmp_path, "necs", names, error_on="urea")
+    provenance = _provenance()
+    write_panel_provenance(tmp_path, "necs", provenance, {"commit": "a" * 40})
+    mapper = _StubMapper({"urea": {"chosen_kg_id": "CHEBI:16199", "kg_equivalent_ids": "{}"}})
+    frame, pin, repair = prepare_panel(
+        mapper,
+        _panel(names, "necs"),
+        tmp_path,
+        "necs",
+        provenance,
+        {"commit": "a" * 40},
+        allow_unpinned=False,
+    )
+    assert pin["status"] == "match"
+    assert repair["recovered"] == 1
+    assert frame["chosen_kg_id"].tolist() == ["CHEBI:1", "CHEBI:16199"]
+
+
+# ==================================================================================================
+# --refresh makes the drift error's advice followable
+# ==================================================================================================
+
+
+def test_refresh_discards_the_checkpoint_and_its_sidecar_then_re_resolves(tmp_path):
+    names = ["glucose"]
+    _checkpoint(tmp_path, "necs", names)
+    write_panel_provenance(tmp_path, "necs", _provenance(kg_version="2.1.0"), {"commit": "a" * 40})
+    mapper = _StubMapper({"glucose": {"chosen_kg_id": "RM:1", "kg_equivalent_ids": "{}"}})
+    frame = resolve_panel(
+        mapper,
+        _panel(names, "necs"),
+        tmp_path,
+        "necs",
+        _provenance(),
+        {"commit": "b" * 40},
+        refresh=True,
+    )
+    assert mapper.requested == [["glucose"]]  # actually re-resolved, not reused
+    assert frame["chosen_kg_id"].tolist() == ["RM:1"]
+    # Re-pinned from the new run rather than inheriting the stale sidecar.
+    sidecar = json.loads((tmp_path / "necs_provenance.json").read_text())
+    assert sidecar["kg_version"] == "2.1.1"
+
+
+def test_without_refresh_an_existing_checkpoint_is_reused(tmp_path):
+    names = ["glucose"]
+    _checkpoint(tmp_path, "necs", names)
+    mapper = _StubMapper({})
+    frame = resolve_panel(mapper, _panel(names, "necs"), tmp_path, "necs")
+    assert mapper.requested == []
+    assert frame["chosen_kg_id"].tolist() == ["CHEBI:1"]

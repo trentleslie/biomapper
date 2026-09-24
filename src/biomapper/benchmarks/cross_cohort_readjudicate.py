@@ -142,6 +142,10 @@ def composition_relation(left: OutsideRecord, right: OutsideRecord) -> str:
         compound, an artifact of the key) and of a constitutional isomer (two compounds, a real
         disagreement). Keto-enol tautomers share an H count; so do Pro-Leu and Leu-Pro, and leucine
         and isoleucine. Composition cannot separate them, so this function does not pretend to.
+    ``hydrogen_difference_unverified``
+        Identical heavy atoms and a small hydrogen difference, but a mass is missing on at least one
+        side, so the difference is NOT confirmed. Kept separate from ``protonation_or_charge``
+        precisely so no caller can state that a mass gap matched when no mass was available.
     ``different``
         The compositions genuinely differ beyond a hydrogen count.
 
@@ -160,7 +164,11 @@ def composition_relation(left: OutsideRecord, right: OutsideRecord) -> str:
     if hydrogen_delta > MAX_HYDROGEN_DELTA:
         return "different"
     if left.mass is None or right.mass is None:
-        return "protonation_or_charge"  # formula-only evidence; the rationale says so
+        # No mass on one side, so the hydrogen difference is unconfirmed. Returning
+        # "protonation_or_charge" here would let the caller state that the mass gap matched, which
+        # is a claim about evidence never obtained, and a genuinely reduced or oxidized
+        # molecule would land in the artifact bucket on the strength of it.
+        return "hydrogen_difference_unverified"
     expected_gap = hydrogen_delta * HYDROGEN_MASS_DA
     if abs(abs(left.mass - right.mass) - expected_gap) <= MASS_TOLERANCE_DA:
         return "protonation_or_charge"
@@ -321,6 +329,14 @@ def classify(
                 f"({outside_necs.formula} vs {outside_cohort.formula}), and the mass gap matches "
                 "the hydrogen-count difference. That is a protonation, zwitterion or salt form of "
                 "one compound; the InChIKey first block is not invariant to it",
+            )
+        if relation == "hydrogen_difference_unverified":
+            return (
+                "outside_source_unresolved",
+                f"the compositions differ only in hydrogen count ({outside_necs.formula} vs "
+                f"{outside_cohort.formula}) but at least one side came back without a monoisotopic "
+                "mass, so the difference could not be confirmed as a protonation state rather than "
+                "a reduction or oxidation. Nothing is concluded",
             )
         if relation == "same_formula":
             return (

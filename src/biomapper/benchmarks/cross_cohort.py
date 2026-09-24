@@ -283,7 +283,8 @@ def check_panel_provenance(
             f"{label}: checkpoint provenance is {status['status']}. Refusing to combine "
             f"panels that cannot be attributed to one backend; {detail}. Re-resolve the panel, "
             "or pass --allow-unpinned-checkpoints to publish the run with the gap recorded "
-            "in the manifest."
+            "in the manifest. To re-resolve: "
+            f"--panel {label} --refresh, which discards the checkpoint and its sidecar."
         )
     return status
 
@@ -295,6 +296,7 @@ def resolve_panel(
     label: str,
     provenance: RunProvenance | None = None,
     client_repo: dict[str, str | bool | None] | None = None,
+    refresh: bool = False,
 ) -> pd.DataFrame:
     """Resolve one panel name-only; checkpoint the mapped TSV so a mid-run 5xx loses nothing.
 
@@ -303,6 +305,15 @@ def resolve_panel(
     """
     dest = out_dir / f"{label}_MAPPED.tsv"
     names = panel.names
+    if dest.exists() and refresh:
+        # The remediation the drift error advises has to be followable. Without this, a stale or
+        # unpinned checkpoint can only be re-resolved by finding and deleting the TSV by hand, and
+        # re-running the documented panel command silently reuses the file it was meant to replace.
+        # The sidecar goes with it: re-pinning a checkpoint whose backend is unknown, rather than
+        # regenerating it, would manufacture provenance instead of recording it.
+        print(f"[resolve] {label}: --refresh, discarding {dest.name} and re-resolving", flush=True)
+        dest.unlink()
+        panel_provenance_path(out_dir, label).unlink(missing_ok=True)
     if dest.exists():
         mapped = pd.read_csv(dest, sep="\t", dtype=str).fillna("")
         assert_alignment(mapped, names, label)
@@ -710,6 +721,34 @@ def run_links(
     return results
 
 
+def prepare_panel(
+    mapper: ApiMapper,
+    panel: CohortPanel,
+    out_dir: Path,
+    label: str,
+    provenance: RunProvenance,
+    client_repo: dict[str, str | bool | None],
+    *,
+    allow_unpinned: bool,
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
+    """Validate, resolve and repair one panel, in that order. Returns (frame, pin, repair).
+
+    The order is the substance. An inherited checkpoint is validated BEFORE anything writes to it,
+    because the repair pass rewrites the TSV with rows from the CURRENT backend. Repairing first and
+    validating second would leave a file holding rows from two backends on disk even though the run
+    then aborts, and a later retry would reuse that mixed file as if it were one backend's output.
+    Validating first means a rejected checkpoint is left exactly as it was found.
+    """
+    existed_before = (out_dir / f"{label}_MAPPED.tsv").exists()
+    if existed_before:
+        pin = check_panel_provenance(out_dir, label, provenance, allow_unpinned=allow_unpinned)
+    else:
+        pin = {"panel": label, "status": "match", "drift": None}
+    frame = resolve_panel(mapper, panel, out_dir, label, provenance, client_repo)
+    frame, repair = repair_errored_rows(mapper, frame, out_dir, label)
+    return frame, pin, repair
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m biomapper.benchmarks.cross_cohort",
@@ -738,6 +777,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--link-only",
         action="store_true",
         help="Skip resolution; link and score from the existing per-panel checkpoints",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="With --panel, discard an existing checkpoint and its sidecar and re-resolve. This is "
+        "the follow-up the drift error advises; without it a stale or unpinned checkpoint can only "
+        "be replaced by deleting the TSV by hand.",
     )
     parser.add_argument(
         "--allow-unpinned-checkpoints",
@@ -789,7 +835,15 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             timeout=args.timeout,
         )
-        resolve_panel(mapper, panels[args.panel], out_dir, args.panel, provenance, client_repo)
+        resolve_panel(
+            mapper,
+            panels[args.panel],
+            out_dir,
+            args.panel,
+            provenance,
+            client_repo,
+            refresh=args.refresh,
+        )
         (out_dir / f"{args.panel}_counters.json").write_text(
             json.dumps(mapper.counters.snapshot(), indent=2, default=str)
         )
@@ -816,20 +870,18 @@ def main(argv: list[str] | None = None) -> int:
     pins: dict[str, dict[str, Any]] = {}
     for label in PANELS:
         checkpoint = out_dir / f"{label}_MAPPED.tsv"
-        existed_before = checkpoint.exists()
-        if args.link_only and not existed_before:
+        if args.link_only and not checkpoint.exists():
             print(f"[fatal] --link-only but {checkpoint} is missing", file=sys.stderr)
             return 2
-        frame = resolve_panel(mapper, panels[label], out_dir, label, provenance, client_repo)
-        frame, repairs[label] = repair_errored_rows(mapper, frame, out_dir, label)
-        # A checkpoint this process resolved was pinned above; one it inherited has to be checked
-        # against the finalizing probe, because it may have come from another deployment or build.
-        if existed_before:
-            pins[label] = check_panel_provenance(
-                out_dir, label, provenance, allow_unpinned=args.allow_unpinned_checkpoints
-            )
-        else:
-            pins[label] = {"panel": label, "status": "match", "drift": None}
+        frame, pins[label], repairs[label] = prepare_panel(
+            mapper,
+            panels[label],
+            out_dir,
+            label,
+            provenance,
+            client_repo,
+            allow_unpinned=args.allow_unpinned_checkpoints,
+        )
         mapped[label] = frame
         curies[label] = curies_by_name(frame, label)
         errored[label] = set(errored_names(frame))
