@@ -646,20 +646,9 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    if args.panel is not None and not args.link_only:
-        mapper = ApiMapper(
-            args.endpoint,
-            api_key=args.api_key,
-            batch_size=args.batch_size,
-            timeout=args.timeout,
-        )
-        resolve_panel(mapper, panels[args.panel], out_dir, args.panel)
-        (out_dir / f"{args.panel}_counters.json").write_text(
-            json.dumps(mapper.counters.snapshot(), indent=2, default=str)
-        )
-        print(f"[done] panel {args.panel} -> {out_dir}/{args.panel}_MAPPED.tsv", flush=True)
-        return 0
-
+    # Probed BEFORE the panel branch, because the panel-only path is the documented workflow and it
+    # is the one whose checkpoints have to carry a backend pin. Probing only at finalization would
+    # leave every sidecar unwritten and the drift check with nothing to compare against.
     provenance = build_run_provenance(
         api_endpoint=args.endpoint, kestrel_url=args.kestrel_url, run_id=f"cross_cohort_{ts}"
     )
@@ -670,6 +659,24 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.panel is not None and not args.link_only:
+        mapper = ApiMapper(
+            args.endpoint,
+            api_key=args.api_key,
+            batch_size=args.batch_size,
+            timeout=args.timeout,
+        )
+        resolve_panel(mapper, panels[args.panel], out_dir, args.panel, provenance)
+        (out_dir / f"{args.panel}_counters.json").write_text(
+            json.dumps(mapper.counters.snapshot(), indent=2, default=str)
+        )
+        print(
+            f"[done] panel {args.panel} -> {out_dir}/{args.panel}_MAPPED.tsv "
+            f"(kg={provenance.kg_build.kg_version} commit={provenance.kg_build.git_commit[:8]})",
+            flush=True,
+        )
+        return 0
     print(
         f"[kg] kestrel={provenance.kestrel_version} kg={provenance.kg_build.kg_version} "
         f"biolink={provenance.kg_build.biolink_version} "
