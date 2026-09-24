@@ -41,9 +41,7 @@ Quick start::
     print(report.n_links, report.a_unresolved)
 """
 
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _dist_version
-
+from biomapper._version import resolve_version as _resolve_version
 from biomapper.client import BioMapperClient
 from biomapper.dataset import map_dataset_file_sync
 from biomapper.exceptions import (
@@ -81,14 +79,10 @@ from biomapper.models import (
 # manifest could name its own package version unambiguously. ``pyproject.toml`` is the one source;
 # ``tests/test_version.py`` fails the build if this module ever reintroduces a literal.
 #
-# The fallback fires only for a source tree with no installed metadata at all (a bare checkout that
-# was never installed). It is a loud sentinel rather than a plausible-looking number, because a
-# provenance field that reads "1.4.0" when nothing is installed is worse than one that reads
-# unknown: only the second tells a reader the value cannot be trusted.
-try:  # pragma: no cover - exercised by tests/test_version.py in both branches
-    __version__ = _dist_version("biomapper")
-except PackageNotFoundError:
-    __version__ = "0.0.0+unknown"
+# Resolution AND the uninstalled fallback both live in ``biomapper._version`` so that this attribute
+# and ``provenance.package_version()`` cannot answer differently in any case, including the
+# no-metadata one.
+__version__ = _resolve_version()
 
 __all__ = [
     # Client

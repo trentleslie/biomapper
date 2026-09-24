@@ -24,12 +24,13 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import uuid
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
+
+from biomapper._version import resolve_version
 
 DEFAULT_KESTREL_URL = "https://kestrel.krakenkg.com/api"
 HEALTH_TIMEOUT = 15.0
@@ -113,10 +114,7 @@ def package_version() -> str:
     answers "what code ran" only as precisely as the install is fresh, which is why the manifest
     also records ``client_git_commit``.
     """
-    try:
-        return version("biomapper")
-    except PackageNotFoundError:  # source checkout that was never installed
-        return UNKNOWN
+    return resolve_version()
 
 
 def client_git_state() -> tuple[str, bool | None]:
@@ -127,12 +125,36 @@ def client_git_state() -> tuple[str, bool | None]:
     carries information for a source or editable install, which is exactly the case where
     ``package_version()`` can go stale against the working tree.
 
+    Two guards keep a wheel from being attributed to somebody else's repository. ``git`` searches
+    parent directories, so a wheel installed into a project-local virtualenv nested inside an
+    unrelated checkout would otherwise report THAT checkout's commit and dirty flag. A manifest
+    naming a commit from a different project is worse than one naming no commit, because it looks
+    like provenance and a reader cannot tell it is wrong. So: refuse any path inside a
+    ``site-packages`` / ``dist-packages`` tree, and require the discovered repository root to BE
+    the package root rather than merely contain it.
+
     Never raises. Provenance capture must not be able to abort a run that is otherwise fine.
     """
     import subprocess
 
-    repo = Path(__file__).resolve().parent.parent.parent.parent
+    here = Path(__file__).resolve()
+    if any(part in {"site-packages", "dist-packages"} for part in here.parts):
+        return UNKNOWN, None
+
+    # .../<repo>/src/biomapper/benchmarks/provenance.py -> <repo>
+    repo = here.parent.parent.parent.parent
     try:
+        toplevel = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+        if not toplevel or Path(toplevel).resolve() != repo:
+            # A repository was found, but it is an ancestor rather than this package's own
+            # checkout. That is somebody else's project; report no commit.
+            return UNKNOWN, None
         sha = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "HEAD"],
             capture_output=True,
