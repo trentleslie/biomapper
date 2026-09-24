@@ -3,6 +3,12 @@
 All notable changes to the `biomapper` Python client are recorded here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+**Published to PyPI:** 0.1.0 through 1.4.0, and 1.5.2. Entries tagged *(not published)* were
+version bumps that landed in this repository but were never uploaded to the release index, so
+`pip install biomapper==<that version>` will not resolve. This matters for any claim about which
+release first contained a module: the source tree and the PyPI index diverge across the 1.5.x
+series.
+
 ## [1.5.2] - 2026-09-24
 
 ### Fixed
@@ -20,7 +26,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Performance only: no count, verdict or published number changes.
 
-## [1.5.1] - 2026-09-24
+## [1.5.1] - 2026-09-24 *(not published)*
 
 ### Fixed
 
@@ -71,7 +77,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reported as 48 of 691 (6.9%); screened, it is **39 of 682 (5.7%)**. The corrupt rows were inflating
   both the numerator and the denominator.
 
-## [1.5.0] - 2026-09-24
+## [1.5.0] - 2026-09-24 *(not published)*
 
 ### Added
 
