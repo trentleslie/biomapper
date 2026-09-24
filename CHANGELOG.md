@@ -3,6 +3,37 @@
 All notable changes to the `biomapper` Python client are recorded here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-09-24
+
+### Fixed
+
+- **The corrupt `4000` gold sentinel no longer becomes a comparable InChIKey block.**
+  `cross_cohort_certify.necs_gold_blocks` called `first_block` on the MOESM5 gold cells without
+  screening them, so the documented corrupt `4000` placeholder became a 4-character "block". A
+  4-character block can never equal a real 14-character one, so every link through that row returned
+  REFUTED, and a refuted verdict reads as a wrong molecule rather than as a broken gold cell.
+
+  Found from `docs/solutions/logic-errors/benchmark-harness-reports-plausible-wrong-number-2026-09-23.md`,
+  which records that `gold_structure.has_gold_structure` exists precisely to reject this sentinel and
+  that nothing in the scoring path called it. That gap applied to this module too.
+
+  Every candidate key is now screened with `has_gold_structure` before `first_block`, and the rejects
+  are counted on the card as `rejected_gold_values` / `n_rows_rejected_for_corrupt_gold` rather than
+  silently dropped.
+
+  The card carries three separate counts, because one row can carry a corrupt cell in either
+  vintage or both: `n_corrupt_gold_cells` (cells), `n_rows_with_any_corrupt_gold` (rows touched),
+  and `n_rows_excluded_by_screen` (rows that actually stopped contributing a block, listed by name).
+  Naming a cell count after rows overstates the damage wherever both vintages are corrupt.
+
+  Measured on the real supplement: `4000` appears on 10 rows. Nine also carry a usable standard-vintage
+  key, so exactly one row (`1-lignoceroyl-gpc (24:0)`) previously reached the block set unscreened and
+  would have produced one spurious refutation. Screened block count 944 to 943.
+
+  **This changes a previously reported number.** The two-vintage first-block disagreement rate was
+  reported as 48 of 691 (6.9%); screened, it is **39 of 682 (5.7%)**. The corrupt rows were inflating
+  both the numerator and the denominator.
+
 ## [1.5.0] - 2026-09-24
 
 ### Added

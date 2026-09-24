@@ -48,7 +48,9 @@ from biomapper.benchmarks.cross_cohort import (
     DEFAULT_ARIVALE_XLSX,
     sha256_path,
 )
+from biomapper.benchmarks.pacing import PUBCHEM_MIN_INTERVAL_S, Pacer
 from biomapper.benchmarks.scorers.cross_cohort_overlap import Link
+from biomapper.benchmarks.scorers.gold_structure import has_gold_structure
 from biomapper.benchmarks.scorers.independent_inchikey import ProvidedBlock
 from biomapper.benchmarks.scorers.independent_link_certificate_overlap import (
     certify_links_tagged,
@@ -83,23 +85,58 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
 
     A row with no curated key yields no entry, which makes any link through it ``refused`` rather
     than certified off nothing.
+
+    Every candidate value is screened with
+    :func:`biomapper.benchmarks.scorers.gold_structure.has_gold_structure`, which rejects blanks and
+    the documented corrupt ``4000`` placeholder. Without the screen a sentinel is a 4-character
+    "block" that can never equal a real 14-character one, so every link through that row comes back
+    REFUTED, and a refuted verdict reads as a wrong molecule rather than as a broken gold cell. The
+    MOESM5 supplement carries ``4000`` on 10 rows; 9 of them also carry a usable standard key, so
+    exactly one row reaches the block set unscreened. One spurious refutation in a hand-adjudicated
+    set is one wrong published claim.
     """
     raw = moesm5.read_bytes()
     bundle = load_necs(raw)
     frame = bundle.input_df
     blocks: dict[str, ProvidedBlock] = {}
     both_present = agree = 0
+    rejected: dict[str, int] = {}
+    rows_with_corrupt: set[str] = set()
+    rows_excluded: list[str] = []
     for _, row in frame.iterrows():
         name = str(row.get("chemical_name", "")).strip()
         if not name:
             continue
-        standard = first_block(str(row.get("gold_inchikey_standard", "")).strip() or None)
-        legacy = first_block(str(row.get("gold_inchikey", "")).strip() or None)
+        raw_standard = str(row.get("gold_inchikey_standard", "")).strip()
+        raw_legacy = str(row.get("gold_inchikey", "")).strip()
+        for candidate in (raw_standard, raw_legacy):
+            if candidate and not has_gold_structure(candidate):
+                rejected[candidate] = rejected.get(candidate, 0) + 1
+                rows_with_corrupt.add(name)
+        # Screened BEFORE first_block: a corrupt cell must not become a comparable block.
+        standard = first_block(raw_standard) if has_gold_structure(raw_standard) else None
+        legacy = first_block(raw_legacy) if has_gold_structure(raw_legacy) else None
         if standard and legacy:
             both_present += 1
             agree += int(standard == legacy)
         block = standard or legacy
         if block is None:
+            # A row lost ONLY because the screen rejected its cells is the decision-relevant count:
+            # it would have contributed a block before the screen, and that block would have been a
+            # guaranteed refutation. A row that was simply blank was never going to contribute.
+            if name in rows_with_corrupt:
+                rows_excluded.append(name)
+            # A TAGGED entry with no block, not an absent entry. Both refuse, but only the tagged
+            # form lets ``certify_links_tagged``'s untagged-sides canary mean what it claims: the
+            # canary is supposed to catch provenance we failed to record, and an absent entry makes
+            # "the gold has no key for this metabolite", which we DID record, indistinguishable from
+            # it. The cohort side already worked this way; this is the same fix on the NECS side.
+            blocks[name] = ProvidedBlock(
+                block=None,
+                source=NECS_GOLD_SOURCE,
+                status="clean_miss",
+                record_id=f"moesm5:{name}",
+            )
             continue
         blocks[name] = ProvidedBlock(
             block=block,
@@ -107,17 +144,36 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
             status="success",
             record_id=f"moesm5:{name}",
         )
+    n_with_block = sum(1 for b in blocks.values() if b.block)
     card = {
         "path": str(moesm5),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "n_rows": int(len(frame)),
-        "n_with_curated_inchikey": len(blocks),
-        "coverage": round(len(blocks) / len(frame), 4) if len(frame) else None,
+        # Counts entries that yielded a usable BLOCK, not entries present. Since a row with no key
+        # now gets a tagged no-block entry, len(blocks) is the row count and would silently turn a
+        # 63% coverage figure into 100%.
+        "n_entries": len(blocks),
+        "n_with_curated_inchikey": n_with_block,
+        "coverage": round(n_with_block / len(frame), 4) if len(frame) else None,
         "two_vintage_first_block_agreement": {
             "both_present": both_present,
             "agree": agree,
             "disagree": both_present - agree,
         },
+        "rejected_gold_values": rejected,
+        # Three distinct counts, because a row can carry a corrupt cell in either vintage or both.
+        # The first counts CELLS, so it exceeds the row count when both vintages are corrupt; the
+        # last is the only one that says how many rows actually stopped contributing a block.
+        "n_corrupt_gold_cells": sum(rejected.values()),
+        "n_rows_with_any_corrupt_gold": len(rows_with_corrupt),
+        "n_rows_excluded_by_screen": len(rows_excluded),
+        "rows_excluded_by_screen": sorted(rows_excluded),
+        "screen": (
+            "candidate keys screened with gold_structure.has_gold_structure, which rejects blanks "
+            "and the corrupt '4000' placeholder. An unscreened sentinel becomes a 4-character "
+            "block that can never match a real one, so every link through that row returns "
+            "REFUTED and reads as a wrong molecule rather than a broken gold cell."
+        ),
         "known_defect": (
             "the NECS curated gold carries roughly 5% InChIKey errors, so a disagreement "
             "with it is "
@@ -127,8 +183,16 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
     return blocks, card
 
 
+# Re-exported from the shared pacer so both PubChem callers in this package use one implementation.
+# The first live certification run fired ~592 lookups with no spacing and got 109 `lookup_failed`
+# back, which is 109 refusals that were run artifacts rather than absent structures.
+
+
 def arivale_independent_blocks(
-    arivale_xlsx: Path, names_needed: set[str]
+    arivale_xlsx: Path,
+    names_needed: set[str],
+    *,
+    min_interval_s: float = PUBCHEM_MIN_INTERVAL_S,
 ) -> tuple[dict[str, ProvidedBlock], dict[str, Any]]:
     """Cohort-side independent blocks for Arivale, resolved from its vendor ids via PubChem.
 
@@ -142,6 +206,7 @@ def arivale_independent_blocks(
     frame = pd.read_excel(arivale_xlsx, sheet_name="Arivale_Metabolomics", dtype=str).fillna("")
     panel = load_cohort_panel(frame, ARIVALE)
     resolver = PubChemInChIKeyResolver()
+    pacer = Pacer(min_interval_s)
 
     blocks: dict[str, ProvidedBlock] = {}
     statuses: Counter[str] = Counter()
@@ -160,12 +225,16 @@ def arivale_independent_blocks(
         # reported coverage gap, and the refusal classifier would then call it a real absence.
         any_transient_failure = False
         if cid:
+            pacer.wait()
             block, status = resolver._cached_resolve(  # noqa: SLF001 - status-aware accessor
                 f"pubchem:{cid}", f"compound/cid/{cid}/property/InChIKey/TXT"
             )
             source = "provided-pubchem"
             any_transient_failure = status == "lookup_failed"
         if block is None and hmdb:
+            # Paced separately. The CID request above already went out, so sleeping once per row
+            # left this fallback unspaced and able to draw a lookup_failed of its own.
+            pacer.wait()
             block, status = resolver._cached_resolve(  # noqa: SLF001
                 f"hmdb:{hmdb}", f"compound/xref/RegistryID/{hmdb}/property/InChIKey/TXT"
             )
@@ -197,6 +266,13 @@ def arivale_independent_blocks(
         "lookup_status": dict(statuses),
         "lookup_route": dict(route),
         "oracle": "PubChem PUG-REST (first block only, connectivity granularity)",
+        "min_interval_s": min_interval_s,
+        "transient_failures": statuses.get("lookup_failed", 0),
+        "transient_failure_warning": (
+            "a lookup_failed is the service pushing back, not an absent structure. Any non-zero "
+            "count here means that many refusals are run artifacts and the certified/refused split "
+            "is not publishable until they are retried."
+        ),
     }
     return blocks, card
 
@@ -239,9 +315,16 @@ def _classify_refusal(a: ProvidedBlock | None, b: ProvidedBlock | None) -> str:
     coverage gaps. Collapsing them into one "refused" bucket is what makes a refusal count look like
     a failure rate.
     """
-    if a is None and (b is None or not b.block):
+    # Tested on the BLOCK, not on entry presence. Both sides now record a tagged entry even when
+    # they have no structure, so an `is None` test would find the NECS entry present, fall through
+    # to the cohort branches, and attribute a NECS-side gap to the cohort. That is what happened the
+    # first time this ran with tagged entries: necs_gold_has_no_curated_inchikey went to zero and
+    # cohort_lookup_clean_miss absorbed its cases.
+    a_has_block = a is not None and bool(a.block)
+    b_has_block = b is not None and bool(b.block)
+    if not a_has_block and not b_has_block:
         return "no_independent_structure_either_side"
-    if a is None:
+    if not a_has_block:
         return "necs_gold_has_no_curated_inchikey"
     if b is None:
         return "cohort_name_absent_from_panel_lookup"

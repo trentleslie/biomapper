@@ -177,9 +177,11 @@ def test_necs_gold_blocks_prefers_the_standard_vintage_and_counts_the_disagreeme
     assert blocks["glucose"].block == "WQZGKKKJIJFFOK"
     assert blocks["cortisone"].block == "ZZZZZZZZZZZZZZ"
     assert blocks["glucose"].source == "gold-necs-moesm5"
-    # A row with no curated key yields no entry, so a link through it refuses rather than certifying
-    # off nothing.
-    assert "unknown_thing" not in blocks
+    # A row with no curated key yields a TAGGED entry carrying no block. It still refuses, but the
+    # tag is what lets the untagged-sides canary mean "provenance we failed to record" rather than
+    # "the gold genuinely has no key here", which we did record.
+    assert blocks["unknown_thing"].block is None
+    assert blocks["unknown_thing"].source == "gold-necs-moesm5"
     assert card["n_rows"] == 3 and card["n_with_curated_inchikey"] == 2
     # The supplement disagreeing with itself is measured, not assumed.
     assert card["two_vintage_first_block_agreement"] == {
@@ -290,3 +292,114 @@ def test_certify_refuses_a_link_file_that_disagrees_with_its_manifest(tmp_path, 
 def test_certify_requires_a_manifest(tmp_path):
     run = _run_dir(tmp_path, write_manifest=False)
     assert certify_module.main(["--run-dir", str(run)]) == 2
+
+
+# ==================================================================================================
+# A corrupt gold cell must not become a comparable block
+# ==================================================================================================
+
+
+def _moesm5_with_corrupt_sentinel(path: Path) -> None:
+    """The documented corrupt '4000' placeholder, in both vintages and in each alone."""
+    pd.DataFrame(
+        {
+            "CHEMICAL_NAME": ["clean", "both_corrupt", "legacy_corrupt_standard_ok", "blank"],
+            "INCHIKEY": [
+                "WQZGKKKJIJFFOK-UHFFFAOYAK",
+                "4000",
+                "4000",
+                "",
+            ],
+            "inchi_key": [
+                "WQZGKKKJIJFFOK-GASJEMHNSA-N",
+                "4000",
+                "MFYSYFVPBJMHGN-ZPOLXVRWSA-N",
+                "",
+            ],
+        }
+    ).to_excel(path, index=False)
+
+
+def test_the_corrupt_sentinel_never_becomes_a_block(tmp_path):
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    blocks, card = necs_gold_blocks(path)
+
+    # Unscreened, "4000" would be a 4-character block that can never equal a real 14-character one,
+    # so every link through this row would come back REFUTED and read as a wrong molecule. The row
+    # is still present, tagged, with NO block, which refuses instead.
+    assert blocks["both_corrupt"].block is None
+    assert blocks["clean"].block == "WQZGKKKJIJFFOK"
+    # A row whose legacy cell is corrupt but whose standard cell is usable still contributes.
+    assert blocks["legacy_corrupt_standard_ok"].block == "MFYSYFVPBJMHGN"
+    assert blocks["blank"].block is None
+    # n_with_curated_inchikey counts rows that yielded a usable BLOCK, not rows with an entry.
+    assert card["n_with_curated_inchikey"] == 2
+
+
+def test_corrupt_cells_rows_and_exclusions_are_counted_separately(tmp_path):
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    _blocks, card = necs_gold_blocks(path)
+    # Three corrupt CELLS across two ROWS: both vintages on one, the legacy vintage on another. A
+    # single count cannot describe both, and naming a cell count after rows overstates the damage.
+    assert card["rejected_gold_values"] == {"4000": 3}
+    assert card["n_corrupt_gold_cells"] == 3
+    assert card["n_rows_with_any_corrupt_gold"] == 2
+    # Only one of those rows actually lost its block: the other still has a usable standard key.
+    assert card["n_rows_excluded_by_screen"] == 1
+    assert card["rows_excluded_by_screen"] == ["both_corrupt"]
+    assert "REFUTED" in card["screen"]
+
+
+def test_a_blank_row_is_not_counted_as_excluded_by_the_screen(tmp_path):
+    # A row with no key at all was never going to contribute; only a row the SCREEN removed counts.
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    _blocks, card = necs_gold_blocks(path)
+    assert "blank" not in card["rows_excluded_by_screen"]
+
+
+def test_a_corrupt_row_does_not_inflate_the_two_vintage_agreement(tmp_path):
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    _blocks, card = necs_gold_blocks(path)
+    # Only "clean" has two usable vintages; the corrupt row must not count as an agreement.
+    assert card["two_vintage_first_block_agreement"] == {
+        "both_present": 1,
+        "agree": 1,
+        "disagree": 0,
+    }
+
+
+def test_coverage_counts_usable_blocks_not_entries(tmp_path):
+    # A row with no key now gets a tagged no-block entry, so len(blocks) is the ROW count. Reporting
+    # that as curated-key coverage would silently turn a 63% figure into 100%.
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    blocks, card = necs_gold_blocks(path)
+    assert card["n_entries"] == len(blocks) == 4
+    assert card["n_with_curated_inchikey"] == 2
+    assert card["coverage"] == 0.5
+
+
+def test_a_necs_side_gap_is_not_attributed_to_the_cohort():
+    # Both sides now carry a tagged entry even with no structure, so a presence test would find the
+    # NECS entry, fall through to the cohort branches, and blame the cohort for a NECS-side gap.
+    cases = adjudicate_cases(
+        [_link()],
+        {"glucose": ProvidedBlock(None, "gold-necs-moesm5", "clean_miss", "moesm5:glucose")},
+        {"glucose": _cohort(GLUCOSE_BLOCK)},  # cohort side is perfectly fine
+    )
+    row = cases.iloc[0]
+    assert row["verdict"] == "refused"
+    assert row["refusal_class"] == "necs_gold_has_no_curated_inchikey"
+
+
+def test_both_sides_tagged_without_blocks_is_its_own_class():
+    cases = adjudicate_cases(
+        [_link()],
+        {"glucose": ProvidedBlock(None, "gold-necs-moesm5", "clean_miss", "moesm5:glucose")},
+        {"glucose": _cohort(None, status="clean_miss")},
+    )
+    assert cases.iloc[0]["refusal_class"] == "no_independent_structure_either_side"

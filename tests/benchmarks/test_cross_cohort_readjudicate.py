@@ -11,6 +11,8 @@ import pandas as pd
 from biomapper.benchmarks.cross_cohort_readjudicate import (
     OutsideRecord,
     OutsideResolver,
+    annotations_state_different_composition,
+    chain_annotations,
     classify,
     composition_relation,
     formula_contains,
@@ -343,3 +345,148 @@ def test_a_confirmed_hydrogen_gap_is_still_called_an_artifact():
     )
     assert outcome == "charge_or_protonation_artifact"
     assert "mass gap matches" in rationale
+
+
+def test_the_resolver_throttles_misses_and_not_cache_hits(monkeypatch):
+    # PubChem asks for at most 5 requests per second. The certification path learned this the
+    # expensive way; this module fires up to two lookups per case, so it needs the same rule.
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+    class _Resp:
+        status_code = 200
+        text = (
+            '{"PropertyTable": {"Properties": [{"InChIKey": "WQZGKKKJIJFFOK-GASJEMHNSA-N",'
+            ' "MolecularFormula": "C6H12O6", "MonoisotopicMass": "180.06"}]}}'
+        )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, _url: str, timeout: float = 0) -> _Resp:
+            self.calls += 1
+            return _Resp()
+
+    session = _Session()
+    resolver = OutsideResolver(session=session, min_interval_s=0.25)
+    resolver.by_name("glucose")
+    resolver.by_name("glucose")  # cache hit: no request, no sleep
+    resolver.by_name("urea")
+    assert session.calls == 2
+    # The first request has no predecessor to space from, so only the second sleeps.
+    assert len(sleeps) == 1 and sleeps[0] <= 0.25
+
+
+def test_throttling_can_be_disabled_for_tests():
+    class _Session:
+        def get(self, _url: str, timeout: float = 0):  # noqa: ANN202
+            raise AssertionError("should not be called")
+
+    resolver = OutsideResolver(session=_Session(), min_interval_s=0)
+    assert resolver._pacer.min_interval_s == 0
+
+
+# ==================================================================================================
+# The two linked names differing is evidence, and it outranks a missing lookup
+# ==================================================================================================
+
+
+def test_differing_chain_annotations_are_adverse_without_any_lookup():
+    # Observed live: "palmitoyl sphingomyelin (d18:1/16:0)" linked to "stearoyl sphingomyelin
+    # (d18:1/18:0)". PubChem cannot parse Metabolon shorthand, but the names state different
+    # compositions, so reporting "nothing concluded" would hide a wrong link behind a missing
+    # lookup.
+    outcome, rationale = classify(
+        GLUCOSE,
+        OTHER,
+        _MISS,
+        _MISS,
+        same_name=False,
+        necs_name="palmitoyl sphingomyelin (d18:1/16:0)",
+        cohort_name="stearoyl sphingomyelin (d18:1/18:0)",
+    )
+    assert outcome == "differing_lipid_chain_annotation"
+    assert "wrong link" in rationale
+
+
+def test_bare_name_inequality_is_not_treated_as_adverse():
+    # Two cohorts can legitimately use synonyms or different formatting for one metabolite. Calling
+    # that suspicious would inflate the triage pile with valid pairs.
+    outcome, rationale = classify(
+        GLUCOSE,
+        OTHER,
+        _MISS,
+        _MISS,
+        same_name=False,
+        necs_name="vitamin E",
+        cohort_name="alpha-tocopherol",
+    )
+    assert outcome == "distinct_vendor_names_structure_unverified"
+    assert "not evidence either way" in rationale
+
+
+def test_an_annotation_on_only_one_side_proves_nothing():
+    # Comparing an annotated name against an unannotated one would turn "cannot tell" into "differ".
+    assert annotations_state_different_composition(
+        "palmitoyl sphingomyelin (d18:1/16:0)", "SM"
+    ) is (False)
+    assert annotations_state_different_composition("glucose", "dextrose") is False
+
+
+def test_matching_annotations_are_not_adverse():
+    # Same chains, different head group (GPC vs GPE) still lands in the triage bucket rather than
+    # being asserted either way: the annotation does not discriminate here.
+    assert (
+        annotations_state_different_composition(
+            "1-palmitoyl-2-linoleoyl-gpc (16:0/18:2)", "1-palmitoyl-2-linoleoyl-GPE (16:0/18:2)"
+        )
+        is False
+    )
+
+
+def test_chain_annotations_are_extracted_case_and_space_insensitively():
+    assert chain_annotations("palmitoyl sphingomyelin (d18:1/16:0)") == frozenset({"d18:1/16:0"})
+    assert chain_annotations("hexanoylcarnitine (C6)") == frozenset()  # not an acyl x:y token
+    assert chain_annotations("no annotation here") == frozenset()
+
+
+def test_same_name_with_no_outside_structure_stays_unadjudicated():
+    outcome, _ = classify(GLUCOSE, OTHER, _MISS, _MISS, same_name=True)
+    assert outcome == "outside_source_unresolved"
+
+
+def test_a_derivative_across_different_names_is_a_wrong_link_not_a_lookup_artifact():
+    # n-oleoyltaurine linked to taurine. Same evidence as the Prolylleucine case, opposite meaning,
+    # and the earlier version excused it as an outside-source artifact.
+    outcome, rationale = classify(
+        "ZKQOUHVVXABNDG", "YCYXUKRYYSXSLJ", PRO_LEU, Z_PRO_LEU, same_name=False
+    )
+    assert outcome == "conjugate_linked_to_parent"
+    assert "WRONG LINK" in rationale
+
+
+def test_a_derivative_under_the_same_name_is_still_a_lookup_artifact():
+    outcome, _ = classify("ZKQOUHVVXABNDG", "YCYXUKRYYSXSLJ", PRO_LEU, Z_PRO_LEU, same_name=True)
+    assert outcome == "outside_source_hit_a_derivative"
+
+
+def test_readjudicate_derives_name_equality_and_records_it():
+    resolver = _StubResolver({})
+    cases = pd.DataFrame(
+        [
+            {
+                "necs_name": "n-oleoyltaurine",
+                "cohort_name": "taurine",
+                "verdict": "refuted",
+                "refusal_class": "",
+                "necs_block": "KOGRJTUIKPMZEJ",
+                "cohort_block": "XOAAWQZATWQOTB",
+            }
+        ]
+    )
+    result = readjudicate(cases, resolver)  # type: ignore[arg-type]
+    row = result.iloc[0]
+    assert bool(row["same_vendor_name"]) is False
+    # Neither name carries an acyl annotation, so this is the triage bucket, not adverse evidence.
+    assert row["readjudication"] == "distinct_vendor_names_structure_unverified"
