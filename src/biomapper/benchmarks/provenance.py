@@ -25,6 +25,7 @@ import datetime as dt
 import logging
 import uuid
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -80,6 +81,12 @@ class RunProvenance(BaseModel):
     run_timestamp: str = ""
     kg_build: KgBuildInfo = Field(default_factory=KgBuildInfo)
     health_error: str | None = None
+    # The CLIENT commit, distinct from ``kg_build.git_commit`` (the graph build). Captured at run
+    # start, because a long suite can outlive the checkout it started from: a 17-hour run on an
+    # editable install took 20+ commits mid-flight, and ``biomapper_version`` could not have
+    # detected that, since the installed metadata does not move when the working tree does.
+    client_git_commit: str = UNKNOWN
+    client_git_dirty: bool | None = None
 
     @property
     def pinned(self) -> bool:
@@ -93,10 +100,58 @@ class RunProvenance(BaseModel):
 
 
 def package_version() -> str:
+    """The client package version recorded in every run manifest.
+
+    Reads the installed distribution metadata, the same source ``biomapper.__version__`` uses, so a
+    manifest and the importing code can never disagree about which client produced a number. Do not
+    reintroduce a literal here or in ``biomapper/__init__.py``: those two literals drifted once
+    already (pyproject 1.5.1 against a hardcoded 1.4.0) and a manifest cannot be audited against a
+    version string that two files answer differently.
+
+    Caveat worth knowing when reading an old manifest: this is the *installed* version, which in an
+    editable checkout goes stale against ``pyproject.toml`` until the package is reinstalled. It
+    answers "what code ran" only as precisely as the install is fresh, which is why the manifest
+    also records ``client_git_commit``.
+    """
     try:
         return version("biomapper")
-    except PackageNotFoundError:  # editable/source checkout without metadata
+    except PackageNotFoundError:  # source checkout that was never installed
         return UNKNOWN
+
+
+def client_git_state() -> tuple[str, bool | None]:
+    """Return ``(commit_sha, is_dirty)`` for the checkout this package is imported from.
+
+    Returns ``(UNKNOWN, None)`` for an installed wheel, which has no repository, and that is a
+    correct answer rather than a failure: a wheel's version string IS its identity. The pair only
+    carries information for a source or editable install, which is exactly the case where
+    ``package_version()`` can go stale against the working tree.
+
+    Never raises. Provenance capture must not be able to abort a run that is otherwise fine.
+    """
+    import subprocess
+
+    repo = Path(__file__).resolve().parent.parent.parent.parent
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(repo), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            ).stdout.strip()
+        )
+        return (sha or UNKNOWN), dirty
+    except Exception:  # noqa: BLE001 - no git, not a repo, or git unavailable; all mean "no commit"
+        return UNKNOWN, None
 
 
 def utc_stamp() -> str:
@@ -164,6 +219,7 @@ def build_run_provenance(
         if probe_live
         else (UNKNOWN, KgBuildInfo(), "probe_live=False")
     )
+    client_sha, client_dirty = client_git_state()
     return RunProvenance(
         run_id=run_id or new_run_id(),
         biomapper_version=package_version(),
@@ -173,6 +229,8 @@ def build_run_provenance(
         run_timestamp=dt.datetime.now(dt.UTC).isoformat(),
         kg_build=kg_build,
         health_error=error,
+        client_git_commit=client_sha,
+        client_git_dirty=client_dirty,
     )
 
 

@@ -72,6 +72,8 @@ def build_manifest(
         "provided_id_columns": [],
         "run_id": provenance.run_id,
         "biomapper_version": provenance.biomapper_version,
+        "client_git_commit": provenance.client_git_commit,
+        "client_git_dirty": provenance.client_git_dirty,
         "api_endpoint": provenance.api_endpoint,
         "kestrel_url": provenance.kestrel_url,
         "kestrel_version": provenance.kestrel_version,
