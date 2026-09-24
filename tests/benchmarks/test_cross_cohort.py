@@ -1,0 +1,613 @@
+"""Cross-cohort (Monti/NECS) arm: panels, linker, Arm-B baseline, link certificate, driver guards.
+
+Ported from the engine's ``studies/external_benchmarks/tests`` (``test_cohort_panel_adapter``,
+``test_arm_b_baseline``, ``test_cross_cohort_overlap``, ``test_link_certificate``,
+``test_link_certificate_disjointness``) at ``origin/dev`` commit
+``1ffb571e54fe028ef0ae4e748fc2e7ec093ee603``, with the import paths rewritten and new coverage for
+what the port changed: the corrected Monti published-overlap table, the driver's positional
+alignment guard, and the agreement between the cohort linker and the generic
+``biomapper.harmonize`` primitive.
+
+Fully offline. No network, no mapper, no knowledge graph.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from biomapper.benchmarks.adapters.cohort_panel import (
+    ARIVALE,
+    BLSA,
+    CohortPanelConfig,
+    load_cohort_panel,
+)
+from biomapper.benchmarks.cross_cohort import (
+    PanelAlignmentError,
+    assert_alignment,
+    client_repo_provenance,
+    cross_check_harmonize,
+    curies_by_name,
+    errored_names,
+    repair_errored_rows,
+)
+from biomapper.benchmarks.scorers.arm_b_baseline import (
+    MONTI_PUBLISHED,
+    MONTI_PUBLISHED_PROVENANCE,
+    MONTI_PUBLISHED_SUPERSEDED,
+    arm_b_overlap,
+    name_match_overlap,
+    refmet_join_overlap,
+)
+from biomapper.benchmarks.scorers.cross_cohort_overlap import (
+    Link,
+    curie_set,
+    link_by_intersection,
+)
+from biomapper.benchmarks.scorers.independent_inchikey import ProvidedBlock
+from biomapper.benchmarks.scorers.independent_link_certificate_overlap import (
+    certify_links,
+    certify_links_tagged,
+)
+from biomapper.benchmarks.scorers.link_certificate import certificate_key, certify_link
+
+GLUCOSE = "WQZGKKKJIJFFOK-GASJEMHNSA-N"
+GLUCOSE_STEREOISOMER = "WQZGKKKJIJFFOK-VFRWLCBQSA-N"  # same connectivity, different stereo layer
+WRONG_MOLECULE = "ZZZZZZZZZZZZZZ-YYYYYYYYYY-N"  # different connectivity (block 1)
+_IK = "FHQVHHIBKUMWTI-OTMQOFQ-N"
+
+
+# ==================================================================================================
+# Panels
+# ==================================================================================================
+
+
+def _arivale_like() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "BiochemicalName": ["glucose", "citrate", "X - 12345", "", "glucose"],
+            "CAS_ID": ["50-99-7", "77-92-9", "", "", "50-99-7"],
+            "KEGG_ID": ["C00031", "C00158", "", "", "C00031"],
+            "HMDB_ID": ["HMDB0000122", "HMDB0000094", "", "", "HMDB0000122"],
+            "PubChem_ID": ["5793", "311", "", "", "5793"],
+        }
+    )
+
+
+def test_loads_names_and_ids_certifiable():
+    panel = load_cohort_panel(_arivale_like(), ARIVALE)
+    assert panel.names == ["glucose", "citrate"]
+    assert set(panel.id_columns) == {"cas", "kegg", "hmdb", "pubchem"}
+    assert panel.certifiable is True
+
+
+def test_exclusions_counted_not_silent():
+    panel = load_cohort_panel(_arivale_like(), ARIVALE)
+    exclusions = panel.card["exclusions"]
+    assert exclusions["blank_name"] == 1
+    assert exclusions["unidentified_x"] == 1
+    assert exclusions["duplicate_name"] == 1
+    assert panel.card["n_raw"] == 5 and panel.card["n_rows"] == 2
+
+
+def test_spreadsheet_cohort_picks_its_column_names_only():
+    frame = pd.DataFrame(
+        {
+            "blsa": ["Alanine", "Arginine", "PC aa C34:2"],
+            "llfs": ["1 Methyluric acid", "", ""],
+            "necs": ["spermidine", "X - 12345", ""],
+            "xuetal": ["palmitate", "", ""],
+        }
+    )
+    panel = load_cohort_panel(frame, BLSA)
+    assert panel.names == ["Alanine", "Arginine", "PC aa C34:2"]
+    # BLSA is names only: its links are countable, never structurally certifiable.
+    assert panel.certifiable is False
+    assert panel.id_columns == ()
+
+
+def test_missing_name_column_fails_loud():
+    with pytest.raises(KeyError):
+        load_cohort_panel(pd.DataFrame({"WrongHeader": ["a", "b"]}), ARIVALE)
+
+
+def test_monti_size_gap_surfaced_not_reconciled():
+    panel = load_cohort_panel(_arivale_like(), ARIVALE)
+    assert panel.card["monti_panel_size"] == 626
+    assert panel.card["monti_size_gap"] == 2 - 626
+
+
+def test_sha_pinned_and_deterministic():
+    config = CohortPanelConfig(key="t", name_column="name")
+    first = load_cohort_panel(b"glucose\ncitrate\n", config, name_list=True)
+    second = load_cohort_panel(b"glucose\ncitrate\n", config, name_list=True)
+    assert first.card["source_sha256"] == second.card["source_sha256"]
+    assert first.names == ["glucose", "citrate"]
+
+
+def test_kegg_only_is_not_certifiable():
+    config = CohortPanelConfig(key="k", name_column="name", id_columns={"kegg": "KEGG_ID"})
+    panel = load_cohort_panel(pd.DataFrame({"name": ["glucose"], "KEGG_ID": ["C00031"]}), config)
+    assert panel.certifiable is False
+
+
+def test_name_list_parsing_strips_and_drops_blanks():
+    config = CohortPanelConfig(key="nl", name_column="name")
+    panel = load_cohort_panel(b"Alanine\n\n  Arginine  \nAlanine\n", config, name_list=True)
+    assert panel.names == ["Alanine", "Arginine"]
+
+
+# ==================================================================================================
+# Linker
+# ==================================================================================================
+
+
+def test_shared_curie_links_disjoint_does_not():
+    a = {"glucose": curie_set("CHEBI:17234", {"KEGG": ["C00031"]})}
+    b = {"glc": curie_set("KEGG:C00031", None), "urea": curie_set("CHEBI:16199", None)}
+    result = link_by_intersection(a, b)
+    assert result.n_links == 1
+    assert result.links[0].a_name == "glucose" and result.links[0].b_name == "glc"
+    assert "KEGG:C00031" in result.links[0].shared
+
+
+def test_canonicalization_positive_control():
+    a = {"m": curie_set("KEGG.COMPOUND:C00031", None)}
+    assert link_by_intersection(a, {"n": curie_set("KEGG:C00031", None)}).n_links == 1
+    assert link_by_intersection(a, {"n": curie_set("KEGG.GLYCAN:G00031", None)}).n_links == 0
+
+
+def test_empty_curie_set_never_links():
+    result = link_by_intersection(
+        {"unresolved": curie_set("", None)}, {"glc": curie_set("KEGG:C00031", None)}
+    )
+    assert result.n_links == 0
+    assert result.n_a_comparable == 0
+
+
+def test_comparable_denominator_counts_resolved_rows_only():
+    result = link_by_intersection(
+        {"x": curie_set("CHEBI:1", None), "y": curie_set("", None)},
+        {"p": curie_set("CHEBI:1", None), "q": curie_set("", "")},
+    )
+    assert result.n_a_comparable == 1 and result.n_b_comparable == 1
+
+
+def test_multiple_shared_curies_yield_one_link_with_all():
+    payload = curie_set("CHEBI:17234", {"KEGG": ["C00031"]})
+    result = link_by_intersection({"m": payload}, {"n": payload})
+    assert result.n_links == 1
+    assert result.links[0].shared == frozenset({"CHEBI:17234", "KEGG:C00031"})
+
+
+def test_one_a_links_multiple_b():
+    result = link_by_intersection(
+        {"m": curie_set("CHEBI:1", None)},
+        {"p": curie_set("CHEBI:1", None), "q": curie_set("CHEBI:1", None)},
+    )
+    assert result.n_links == 2 and result.n_a_linked == 1 and result.n_b_linked == 2
+
+
+def test_curie_set_parses_dict_and_excludes_structural_namespaces():
+    # INCHIKEY is a STRUCTURE hash. Letting it into the identifier-only linker would make the
+    # downstream certificate circular and precision 100% by construction.
+    as_dict = curie_set(
+        "CHEBI:17234",
+        {
+            "KEGG": ["C00031"],
+            "PUBCHEM.COMPOUND": ["5793", ""],
+            "INCHIKEY": [GLUCOSE],
+        },
+    )
+    assert as_dict == frozenset({"CHEBI:17234", "KEGG:C00031", "PUBCHEM:5793"})
+    as_str = curie_set("CHEBI:17234", "{'KEGG': ['C00031'], 'PUBCHEM.COMPOUND': ['5793']}")
+    assert as_str == frozenset({"CHEBI:17234", "KEGG:C00031", "PUBCHEM:5793"})
+
+
+def test_no_links_when_both_sides_empty():
+    result = link_by_intersection({"a": curie_set("", None)}, {"b": curie_set(None, None)})
+    assert result.n_links == 0 and result.n_a_linked == 0 and result.n_b_linked == 0
+
+
+def test_cohort_linker_and_generic_harmonize_agree():
+    # Two implementations of one rule. If they diverge a published number moves for a reason that
+    # has nothing to do with the engine, so the driver asserts the agreement per pair.
+    a = {
+        "glucose": curie_set("CHEBI:17234", {"KEGG": ["C00031"], "INCHIKEY": [GLUCOSE]}),
+        "orphan": curie_set("", None),
+    }
+    b = {"glc": curie_set("KEGG.COMPOUND:C00031", None), "urea": curie_set("CHEBI:16199", None)}
+    check = cross_check_harmonize(a, b)
+    assert check["agree"] is True
+    assert check["scorer_n_links"] == check["harmonize_n_links"] == 1
+
+
+# ==================================================================================================
+# Arm-B baseline, including the corrected published table
+# ==================================================================================================
+
+
+def test_name_match_case_insensitive():
+    assert name_match_overlap(
+        ["Glucose", "Citrate"], ["glucose", "urea"], case_sensitive=False
+    ) == {"glucose"}
+
+
+def test_name_match_case_sensitive_does_not_fold():
+    assert name_match_overlap(["Glucose"], ["glucose"], case_sensitive=True) == set()
+
+
+def test_refmet_drops_non_standardizing_before_join():
+    refmet = {"alpha-D-glucose": "Glucose", "D-glucose": "Glucose"}
+    assert refmet_join_overlap(
+        ["alpha-D-glucose", "mystery"], ["D-glucose", "mystery"], refmet
+    ) == {"glucose"}
+
+
+def test_refmet_matches_via_shared_standard_name():
+    assert refmet_join_overlap(["raw_a"], ["raw_b"], {"raw_a": "Taurine", "raw_b": "Taurine"}) == {
+        "taurine"
+    }
+
+
+def test_dispatch_selects_method_per_cohort():
+    arivale = arm_b_overlap("arivale", ["Glucose"], ["glucose"])
+    xu = arm_b_overlap("xuetal", ["Glucose"], ["glucose"])
+    llfs = arm_b_overlap("llfs", ["a"], ["b"], refmet_map={"a": "X", "b": "X"})
+    assert arivale.count == 1 and "case-insensitive" in arivale.method
+    assert xu.count == 0 and "case-sensitive" in xu.method
+    assert llfs.count == 1 and "RefMet" in llfs.method
+
+
+def test_unknown_cohort_fails_loud():
+    with pytest.raises(ValueError):
+        arm_b_overlap("mystery_cohort", ["a"], ["a"])
+
+
+def test_refmet_cohort_without_map_fails_loud():
+    with pytest.raises(ValueError):
+        arm_b_overlap("llfs", ["a"], ["a"])
+
+
+def test_gap_to_monti_published_is_recorded():
+    result = arm_b_overlap("arivale", ["Glucose"], ["glucose"])
+    assert result.published == 615 and result.gap == 1 - 615
+
+
+def test_monti_published_table_is_the_corrected_one():
+    # Re-read from Monti 2026 Methods, "Datasets harmonization". Xu is 385 there (the paper also
+    # says 432 in its Xu cohort description, which is an internal contradiction). BLSA is 188; the
+    # engine's 99 was the BLSA<->LLFS overlap, a different pair.
+    assert {"arivale": 615, "xuetal": 385, "llfs": 163, "blsa": 188} == MONTI_PUBLISHED
+
+
+def test_superseded_values_are_retained_for_traceability():
+    assert {"arivale": 615, "xuetal": 432, "llfs": 163, "blsa": 99} == MONTI_PUBLISHED_SUPERSEDED
+    assert MONTI_PUBLISHED_SUPERSEDED["blsa"] != MONTI_PUBLISHED["blsa"]
+    assert MONTI_PUBLISHED_SUPERSEDED["xuetal"] != MONTI_PUBLISHED["xuetal"]
+
+
+def test_every_published_value_carries_a_quote_and_section():
+    for cohort, published in MONTI_PUBLISHED.items():
+        record = MONTI_PUBLISHED_PROVENANCE[cohort]
+        assert record["published"] == published
+        assert record["quote"] and record["section"]
+    # Only the two pairs the paper disagrees with itself about carry a conflict record.
+    assert MONTI_PUBLISHED_PROVENANCE["arivale"]["conflict"] is None
+    assert MONTI_PUBLISHED_PROVENANCE["llfs"]["conflict"] is None
+    assert MONTI_PUBLISHED_PROVENANCE["xuetal"]["conflict"]["alternate"] == 432
+    assert MONTI_PUBLISHED_PROVENANCE["blsa"]["conflict"]["alternate"] == 99
+
+
+# ==================================================================================================
+# Link certificate
+# ==================================================================================================
+
+
+def test_certified_when_independent_structures_agree():
+    certificate = certify_link(GLUCOSE, GLUCOSE)
+    assert certificate.verdict == "certified" and certificate.stereo_checked is True
+
+
+def test_refuted_on_connectivity_disagreement():
+    certificate = certify_link(GLUCOSE, WRONG_MOLECULE)
+    assert certificate.verdict == "refuted" and "connectivity" in certificate.reason
+
+
+def test_refuted_on_stereoisomer():
+    certificate = certify_link(GLUCOSE, GLUCOSE_STEREOISOMER)
+    assert certificate.verdict == "refuted" and certificate.stereo_checked is True
+
+
+def test_co_derivation_positive_control():
+    # The only thing preventing a false certify is passing the INDEPENDENT structure rather than
+    # the KG node that formed the link.
+    assert certify_link(GLUCOSE, WRONG_MOLECULE).verdict == "refuted"
+    assert certify_link(GLUCOSE, GLUCOSE).verdict == "certified"
+
+
+def test_refused_when_cohort_has_no_independent_structure():
+    certificate = certify_link(GLUCOSE, None)
+    assert certificate.verdict == "refused" and "cohort" in certificate.reason
+
+
+def test_refused_on_lookup_failure_not_crash():
+    certificate = certify_link(None, GLUCOSE)
+    assert certificate.verdict == "refused" and "NECS" in certificate.reason
+
+
+def test_first_block_only_certifies_at_connectivity():
+    # The independent resolver's granularity is the first block, which is neither tautomer- nor
+    # charge-invariant, so stereo is explicitly flagged as unchecked rather than passed silently.
+    certificate = certify_link("WQZGKKKJIJFFOK", "WQZGKKKJIJFFOK")
+    assert certificate.verdict == "certified" and certificate.stereo_checked is False
+
+
+def test_certificate_key_parsing():
+    full = certificate_key(GLUCOSE)
+    assert full is not None and full.connectivity == "WQZGKKKJIJFFOK" and full.stereo8 == "GASJEMHN"
+    assert certificate_key("WQZGKKKJIJFFOK").stereo8 is None
+    assert certificate_key("") is None and certificate_key(None) is None
+
+
+def test_kg_tagged_side_refuses_even_when_blocks_match():
+    assert (
+        certify_link(_IK, _IK, necs_source="kg", cohort_source="provided-hmdb").verdict == "refused"
+    )
+
+
+def test_untagged_side_refuses_in_strict_mode():
+    certificate = certify_link(
+        _IK, _IK, necs_source="provided-hmdb", cohort_source=None, require_tags=True
+    )
+    assert certificate.verdict == "refused"
+
+
+def test_tagged_independent_sides_certify():
+    certificate = certify_link(
+        _IK, _IK, necs_source="provided-hmdb", cohort_source="provided-pubchem", require_tags=True
+    )
+    assert certificate.verdict == "certified"
+
+
+def test_legitimate_same_source_still_certifies():
+    certificate = certify_link(
+        _IK, _IK, necs_source="provided-hmdb", cohort_source="provided-hmdb", require_tags=True
+    )
+    assert certificate.verdict == "certified"
+
+
+def _link(a: str, b: str) -> Link:
+    return Link(a_name=a, b_name=b, shared=frozenset())
+
+
+def test_certify_links_untagged_path():
+    overlap = certify_links(
+        [_link("n1", "c1"), _link("n2", "c2")],
+        {"n1": GLUCOSE, "n2": GLUCOSE},
+        {"c1": GLUCOSE, "c2": None},
+    )
+    assert overlap.certified == 1 and overlap.refused == 1
+    assert overlap.adjudicable == 1 and overlap.certified_rate == 1.0
+
+
+def test_certified_rate_is_none_when_nothing_adjudicable():
+    overlap = certify_links([_link("n", "c")], {"n": GLUCOSE}, {})
+    assert overlap.adjudicable == 0 and overlap.certified_rate is None
+
+
+def test_certify_links_tagged_counts_and_canary():
+    links = [_link("necs_glucose", "coh_glucose"), _link("necs_x", "coh_missing")]
+    a = {
+        "necs_glucose": ProvidedBlock(_IK, "provided-hmdb", "success"),
+        "necs_x": ProvidedBlock("AAAAAAAAAAAAAA", "provided-hmdb", "success"),
+    }
+    b = {"coh_glucose": ProvidedBlock(_IK, "provided-pubchem", "success")}
+    overlap, untagged = certify_links_tagged(links, a, b)
+    assert overlap.certified == 1
+    assert overlap.refused == 1
+    assert untagged == 1
+
+
+def test_certify_links_tagged_record_independence():
+    same = [_link("glucose", "glucose")]
+    a_same = {"glucose": ProvidedBlock(_IK, "provided-hmdb", "success", record_id="gold:glucose")}
+    b_same = {"glucose": ProvidedBlock(_IK, "provided-hmdb", "success", record_id="gold:glucose")}
+    overlap_same, _ = certify_links_tagged(same, a_same, b_same)
+    assert overlap_same.certified == 0 and overlap_same.refused == 1
+    b_distinct = {
+        "glucose": ProvidedBlock(_IK, "provided-hmdb", "success", record_id="arivale:glucose")
+    }
+    overlap_distinct, _ = certify_links_tagged(same, a_same, b_distinct)
+    assert overlap_distinct.certified == 1
+
+
+def test_certify_links_tagged_kg_block_refused():
+    overlap, _ = certify_links_tagged(
+        [_link("n", "c")],
+        {"n": ProvidedBlock(_IK, "kg", "success")},
+        {"c": ProvidedBlock(_IK, "provided-pubchem", "success")},
+    )
+    assert overlap.certified == 0 and overlap.refused == 1
+
+
+# ==================================================================================================
+# Driver guards
+# ==================================================================================================
+
+
+def test_assert_alignment_accepts_matching_frame():
+    frame = pd.DataFrame({"name": ["a", "b", "c"]})
+    assert_alignment(frame, ["a", "b", "c"], "panel")
+
+
+def test_assert_alignment_rejects_reordered_frame():
+    # The batch-order hazard: a reordered response would attribute one metabolite's CURIE set to
+    # another, silently. Nothing is realigned, because a panel name is not guaranteed unique.
+    frame = pd.DataFrame({"name": ["b", "a", "c"]})
+    with pytest.raises(PanelAlignmentError):
+        assert_alignment(frame, ["a", "b", "c"], "panel")
+
+
+def test_assert_alignment_rejects_truncated_frame():
+    with pytest.raises(PanelAlignmentError):
+        assert_alignment(pd.DataFrame({"name": ["a", "b"]}), ["a", "b", "c"], "panel")
+
+
+def test_curies_by_name_rejects_duplicate_panel_names():
+    frame = pd.DataFrame(
+        {
+            "name": ["glucose", "glucose"],
+            "chosen_kg_id": ["CHEBI:17234", "CHEBI:4167"],
+            "kg_equivalent_ids": ["{}", "{}"],
+        }
+    )
+    with pytest.raises(PanelAlignmentError):
+        curies_by_name(frame, "panel")
+
+
+def test_curies_by_name_excludes_structural_namespaces_end_to_end():
+    frame = pd.DataFrame(
+        {
+            "name": ["glucose"],
+            "chosen_kg_id": ["RM:0135901"],
+            "kg_equivalent_ids": [f'{{"CHEBI": ["17234"], "INCHIKEY": ["{GLUCOSE}"]}}'],
+        }
+    )
+    assert curies_by_name(frame, "panel") == {"glucose": frozenset({"RM:0135901", "CHEBI:17234"})}
+
+
+# ==================================================================================================
+# Error rows are not unresolved rows
+# ==================================================================================================
+
+
+def test_errored_names_lists_only_failed_calls():
+    frame = pd.DataFrame(
+        {
+            "name": ["a", "b", "c"],
+            "chosen_kg_id": ["CHEBI:1", "", ""],
+            "kg_equivalent_ids": ["{}", "{}", "{}"],
+            "mapping_error": ["", "503 Server Error", "nan"],
+        }
+    )
+    # "b" errored. "c" simply did not resolve. Both have an empty CURIE set, and conflating them
+    # would report a non-resolution that never happened.
+    assert errored_names(frame) == ["b"]
+    assert curies_by_name(frame, "panel")["b"] == frozenset()
+    assert curies_by_name(frame, "panel")["c"] == frozenset()
+
+
+def test_errored_names_empty_when_no_error_column():
+    frame = pd.DataFrame({"name": ["a"], "chosen_kg_id": ["CHEBI:1"], "kg_equivalent_ids": ["{}"]})
+    assert errored_names(frame) == []
+
+
+class _StubMapper:
+    """Minimal ApiMapper stand-in: records what it was asked to re-map and answers from a table."""
+
+    endpoint = "https://stub.invalid/api/v1"
+
+    def __init__(self, answers: dict[str, dict[str, str]]) -> None:
+        self.answers = answers
+        self.requested: list[list[str]] = []
+
+    def map_dataset_to_kg(self, **kwargs: object) -> tuple[str, dict[str, object]]:
+        dataset = kwargs["dataset"]
+        out_dir = Path(str(kwargs["output_dir"]))
+        prefix = str(kwargs["output_prefix"])
+        names = [str(n) for n in dataset["name"].tolist()]  # type: ignore[index]
+        self.requested.append(names)
+        rows = [
+            {
+                "name": name,
+                "chosen_kg_id": self.answers.get(name, {}).get("chosen_kg_id", ""),
+                "kg_equivalent_ids": self.answers.get(name, {}).get("kg_equivalent_ids", "{}"),
+                "mapping_error": self.answers.get(name, {}).get("mapping_error", ""),
+            }
+            for name in names
+        ]
+        path = out_dir / f"{prefix}_MAPPED.tsv"
+        pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
+        return str(path), {}
+
+
+def _errored_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "name": ["a", "b", "c"],
+            "chosen_kg_id": ["CHEBI:1", "", ""],
+            "kg_equivalent_ids": ["{}", "{}", "{}"],
+            "mapping_error": ["", "503 Server Error", ""],
+        }
+    )
+
+
+def test_repair_rewrites_only_the_errored_row_in_place(tmp_path):
+    mapper = _StubMapper({"b": {"chosen_kg_id": "CHEBI:2", "kg_equivalent_ids": "{}"}})
+    frame, summary = repair_errored_rows(mapper, _errored_frame(), tmp_path, "panel")
+    assert mapper.requested == [["b"]]  # only the failed row is re-sent
+    assert summary == {
+        "attempted": 1,
+        "recovered": 1,
+        "still_errored": 0,
+        "still_errored_names": [],
+    }
+    # The repaired value lands on the row it came from, and its neighbours are untouched.
+    assert frame["name"].tolist() == ["a", "b", "c"]
+    assert frame["chosen_kg_id"].tolist() == ["CHEBI:1", "CHEBI:2", ""]
+    assert (tmp_path / "panel_MAPPED.tsv").exists()
+
+
+def test_repair_reports_a_row_that_errors_again_rather_than_hiding_it(tmp_path):
+    mapper = _StubMapper({"b": {"mapping_error": "503 Server Error"}})
+    frame, summary = repair_errored_rows(mapper, _errored_frame(), tmp_path, "panel")
+    assert summary["recovered"] == 0 and summary["still_errored"] == 1
+    assert summary["still_errored_names"] == ["b"]
+    assert errored_names(frame) == ["b"]
+
+
+def test_repair_is_a_no_op_when_nothing_errored(tmp_path):
+    clean = pd.DataFrame(
+        {
+            "name": ["a"],
+            "chosen_kg_id": ["CHEBI:1"],
+            "kg_equivalent_ids": ["{}"],
+            "mapping_error": [""],
+        }
+    )
+    mapper = _StubMapper({})
+    frame, summary = repair_errored_rows(mapper, clean, tmp_path, "panel")
+    assert mapper.requested == []
+    assert summary == {"attempted": 0, "recovered": 0, "still_errored": 0}
+    assert frame["chosen_kg_id"].tolist() == ["CHEBI:1"]
+
+
+def test_repair_refuses_a_misaligned_response(tmp_path):
+    class _WrongOrderMapper(_StubMapper):
+        def map_dataset_to_kg(self, **kwargs: object) -> tuple[str, dict[str, object]]:
+            out_dir = Path(str(kwargs["output_dir"]))
+            path = out_dir / "wrong_MAPPED.tsv"
+            pd.DataFrame(
+                [
+                    {
+                        "name": "not-b",
+                        "chosen_kg_id": "CHEBI:9",
+                        "kg_equivalent_ids": "{}",
+                        "mapping_error": "",
+                    }
+                ]
+            ).to_csv(path, sep="\t", index=False)
+            return str(path), {}
+
+    with pytest.raises(PanelAlignmentError):
+        repair_errored_rows(_WrongOrderMapper({}), _errored_frame(), tmp_path, "panel")
+
+
+def test_client_repo_provenance_names_the_code_that_ran():
+    record = client_repo_provenance()
+    assert set(record) == {"repo", "commit", "dirty"}
+    # A wheel install has no repository; that is reported as None rather than invented.
+    assert record["commit"] is None or len(str(record["commit"])) == 40
