@@ -205,8 +205,11 @@ def arivale_independent_blocks(
 
     frame = pd.read_excel(arivale_xlsx, sheet_name="Arivale_Metabolomics", dtype=str).fillna("")
     panel = load_cohort_panel(frame, ARIVALE)
-    resolver = PubChemInChIKeyResolver()
-    pacer = Pacer(min_interval_s)
+    # The pacer goes INTO the resolver so it fires on the request path only. Calling it here, at the
+    # call site, paced cache hits as well: the panel de-duplicates on NAME, not on identifier, so
+    # distinct names can share a PubChem CID or HMDB accession and each repeat cost up to a full
+    # interval without issuing a request, and delayed the next real lookup on top.
+    resolver = PubChemInChIKeyResolver(pacer=Pacer(min_interval_s))
 
     blocks: dict[str, ProvidedBlock] = {}
     statuses: Counter[str] = Counter()
@@ -225,16 +228,14 @@ def arivale_independent_blocks(
         # reported coverage gap, and the refusal classifier would then call it a real absence.
         any_transient_failure = False
         if cid:
-            pacer.wait()
             block, status = resolver._cached_resolve(  # noqa: SLF001 - status-aware accessor
                 f"pubchem:{cid}", f"compound/cid/{cid}/property/InChIKey/TXT"
             )
             source = "provided-pubchem"
             any_transient_failure = status == "lookup_failed"
         if block is None and hmdb:
-            # Paced separately. The CID request above already went out, so sleeping once per row
-            # left this fallback unspaced and able to draw a lookup_failed of its own.
-            pacer.wait()
+            # Paced by the resolver, on its request path. Sleeping once per row left this fallback
+            # unspaced and able to draw a lookup_failed of its own.
             block, status = resolver._cached_resolve(  # noqa: SLF001
                 f"hmdb:{hmdb}", f"compound/xref/RegistryID/{hmdb}/property/InChIKey/TXT"
             )
