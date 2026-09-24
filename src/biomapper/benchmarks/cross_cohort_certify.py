@@ -125,6 +125,17 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
             # guaranteed refutation. A row that was simply blank was never going to contribute.
             if name in rows_with_corrupt:
                 rows_excluded.append(name)
+            # A TAGGED entry with no block, not an absent entry. Both refuse, but only the tagged
+            # form lets ``certify_links_tagged``'s untagged-sides canary mean what it claims: the
+            # canary is supposed to catch provenance we failed to record, and an absent entry makes
+            # "the gold has no key for this metabolite", which we DID record, indistinguishable from
+            # it. The cohort side already worked this way; this is the same fix on the NECS side.
+            blocks[name] = ProvidedBlock(
+                block=None,
+                source=NECS_GOLD_SOURCE,
+                status="clean_miss",
+                record_id=f"moesm5:{name}",
+            )
             continue
         blocks[name] = ProvidedBlock(
             block=block,
@@ -132,12 +143,17 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
             status="success",
             record_id=f"moesm5:{name}",
         )
+    n_with_block = sum(1 for b in blocks.values() if b.block)
     card = {
         "path": str(moesm5),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "n_rows": int(len(frame)),
-        "n_with_curated_inchikey": len(blocks),
-        "coverage": round(len(blocks) / len(frame), 4) if len(frame) else None,
+        # Counts entries that yielded a usable BLOCK, not entries present. Since a row with no key
+        # now gets a tagged no-block entry, len(blocks) is the row count and would silently turn a
+        # 63% coverage figure into 100%.
+        "n_entries": len(blocks),
+        "n_with_curated_inchikey": n_with_block,
+        "coverage": round(n_with_block / len(frame), 4) if len(frame) else None,
         "two_vintage_first_block_agreement": {
             "both_present": both_present,
             "agree": agree,
@@ -166,8 +182,18 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
     return blocks, card
 
 
+# PubChem PUG-REST asks for no more than 5 requests per second. The first live certification run
+# fired ~592 lookups with no spacing and got 109 `lookup_failed` back, which is 109 refusals that
+# were run artifacts rather than absent structures. Spacing the calls is the difference between a
+# refusal that means something and one that means the service pushed back.
+PUBCHEM_MIN_INTERVAL_S = 0.25
+
+
 def arivale_independent_blocks(
-    arivale_xlsx: Path, names_needed: set[str]
+    arivale_xlsx: Path,
+    names_needed: set[str],
+    *,
+    min_interval_s: float = PUBCHEM_MIN_INTERVAL_S,
 ) -> tuple[dict[str, ProvidedBlock], dict[str, Any]]:
     """Cohort-side independent blocks for Arivale, resolved from its vendor ids via PubChem.
 
@@ -176,6 +202,8 @@ def arivale_independent_blocks(
     ``lookup_failed`` is kept distinct from a ``clean_miss``: a network failure must never be
     reported as an absent structure.
     """
+    import time
+
     from biomapper.benchmarks.scorers.independent_inchikey import PubChemInChIKeyResolver
 
     frame = pd.read_excel(arivale_xlsx, sheet_name="Arivale_Metabolomics", dtype=str).fillna("")
@@ -191,6 +219,8 @@ def arivale_independent_blocks(
             continue
         cid = str(row.get("pubchem", "")).strip()
         hmdb = str(row.get("hmdb", "")).strip()
+        if (cid or hmdb) and min_interval_s:
+            time.sleep(min_interval_s)
         block: str | None = None
         source = "none"
         status = "clean_miss"
@@ -236,6 +266,13 @@ def arivale_independent_blocks(
         "lookup_status": dict(statuses),
         "lookup_route": dict(route),
         "oracle": "PubChem PUG-REST (first block only, connectivity granularity)",
+        "min_interval_s": min_interval_s,
+        "transient_failures": statuses.get("lookup_failed", 0),
+        "transient_failure_warning": (
+            "a lookup_failed is the service pushing back, not an absent structure. Any non-zero "
+            "count here means that many refusals are run artifacts and the certified/refused split "
+            "is not publishable until they are retried."
+        ),
     }
     return blocks, card
 

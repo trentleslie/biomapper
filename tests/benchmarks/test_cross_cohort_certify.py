@@ -177,9 +177,11 @@ def test_necs_gold_blocks_prefers_the_standard_vintage_and_counts_the_disagreeme
     assert blocks["glucose"].block == "WQZGKKKJIJFFOK"
     assert blocks["cortisone"].block == "ZZZZZZZZZZZZZZ"
     assert blocks["glucose"].source == "gold-necs-moesm5"
-    # A row with no curated key yields no entry, so a link through it refuses rather than certifying
-    # off nothing.
-    assert "unknown_thing" not in blocks
+    # A row with no curated key yields a TAGGED entry carrying no block. It still refuses, but the
+    # tag is what lets the untagged-sides canary mean "provenance we failed to record" rather than
+    # "the gold genuinely has no key here", which we did record.
+    assert blocks["unknown_thing"].block is None
+    assert blocks["unknown_thing"].source == "gold-necs-moesm5"
     assert card["n_rows"] == 3 and card["n_with_curated_inchikey"] == 2
     # The supplement disagreeing with itself is measured, not assumed.
     assert card["two_vintage_first_block_agreement"] == {
@@ -324,12 +326,15 @@ def test_the_corrupt_sentinel_never_becomes_a_block(tmp_path):
     blocks, card = necs_gold_blocks(path)
 
     # Unscreened, "4000" would be a 4-character block that can never equal a real 14-character one,
-    # so every link through this row would come back REFUTED and read as a wrong molecule.
-    assert "both_corrupt" not in blocks
+    # so every link through this row would come back REFUTED and read as a wrong molecule. The row
+    # is still present, tagged, with NO block, which refuses instead.
+    assert blocks["both_corrupt"].block is None
     assert blocks["clean"].block == "WQZGKKKJIJFFOK"
     # A row whose legacy cell is corrupt but whose standard cell is usable still contributes.
     assert blocks["legacy_corrupt_standard_ok"].block == "MFYSYFVPBJMHGN"
-    assert "blank" not in blocks
+    assert blocks["blank"].block is None
+    # n_with_curated_inchikey counts rows that yielded a usable BLOCK, not rows with an entry.
+    assert card["n_with_curated_inchikey"] == 2
 
 
 def test_corrupt_cells_rows_and_exclusions_are_counted_separately(tmp_path):
@@ -365,3 +370,14 @@ def test_a_corrupt_row_does_not_inflate_the_two_vintage_agreement(tmp_path):
         "agree": 1,
         "disagree": 0,
     }
+
+
+def test_coverage_counts_usable_blocks_not_entries(tmp_path):
+    # A row with no key now gets a tagged no-block entry, so len(blocks) is the ROW count. Reporting
+    # that as curated-key coverage would silently turn a 63% figure into 100%.
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    blocks, card = necs_gold_blocks(path)
+    assert card["n_entries"] == len(blocks) == 4
+    assert card["n_with_curated_inchikey"] == 2
+    assert card["coverage"] == 0.5
