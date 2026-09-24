@@ -332,14 +332,27 @@ def test_the_corrupt_sentinel_never_becomes_a_block(tmp_path):
     assert "blank" not in blocks
 
 
-def test_rejected_gold_values_are_counted_not_silently_dropped(tmp_path):
+def test_corrupt_cells_rows_and_exclusions_are_counted_separately(tmp_path):
     path = tmp_path / "moesm5.xlsx"
     _moesm5_with_corrupt_sentinel(path)
     _blocks, card = necs_gold_blocks(path)
-    # Three corrupt cells across two rows: both vintages on one, the legacy vintage on another.
+    # Three corrupt CELLS across two ROWS: both vintages on one, the legacy vintage on another. A
+    # single count cannot describe both, and naming a cell count after rows overstates the damage.
     assert card["rejected_gold_values"] == {"4000": 3}
-    assert card["n_rows_rejected_for_corrupt_gold"] == 3
+    assert card["n_corrupt_gold_cells"] == 3
+    assert card["n_rows_with_any_corrupt_gold"] == 2
+    # Only one of those rows actually lost its block: the other still has a usable standard key.
+    assert card["n_rows_excluded_by_screen"] == 1
+    assert card["rows_excluded_by_screen"] == ["both_corrupt"]
     assert "REFUTED" in card["screen"]
+
+
+def test_a_blank_row_is_not_counted_as_excluded_by_the_screen(tmp_path):
+    # A row with no key at all was never going to contribute; only a row the SCREEN removed counts.
+    path = tmp_path / "moesm5.xlsx"
+    _moesm5_with_corrupt_sentinel(path)
+    _blocks, card = necs_gold_blocks(path)
+    assert "blank" not in card["rows_excluded_by_screen"]
 
 
 def test_a_corrupt_row_does_not_inflate_the_two_vintage_agreement(tmp_path):

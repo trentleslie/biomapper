@@ -21,6 +21,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are counted on the card as `rejected_gold_values` / `n_rows_rejected_for_corrupt_gold` rather than
   silently dropped.
 
+  The card carries three separate counts, because one row can carry a corrupt cell in either
+  vintage or both: `n_corrupt_gold_cells` (cells), `n_rows_with_any_corrupt_gold` (rows touched),
+  and `n_rows_excluded_by_screen` (rows that actually stopped contributing a block, listed by name).
+  Naming a cell count after rows overstates the damage wherever both vintages are corrupt.
+
   Measured on the real supplement: `4000` appears on 10 rows. Nine also carry a usable standard-vintage
   key, so exactly one row (`1-lignoceroyl-gpc (24:0)`) previously reached the block set unscreened and
   would have produced one spurious refutation. Screened block count 944 to 943.

@@ -100,6 +100,8 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
     blocks: dict[str, ProvidedBlock] = {}
     both_present = agree = 0
     rejected: dict[str, int] = {}
+    rows_with_corrupt: set[str] = set()
+    rows_excluded: list[str] = []
     for _, row in frame.iterrows():
         name = str(row.get("chemical_name", "")).strip()
         if not name:
@@ -109,6 +111,7 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
         for candidate in (raw_standard, raw_legacy):
             if candidate and not has_gold_structure(candidate):
                 rejected[candidate] = rejected.get(candidate, 0) + 1
+                rows_with_corrupt.add(name)
         # Screened BEFORE first_block: a corrupt cell must not become a comparable block.
         standard = first_block(raw_standard) if has_gold_structure(raw_standard) else None
         legacy = first_block(raw_legacy) if has_gold_structure(raw_legacy) else None
@@ -117,6 +120,11 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
             agree += int(standard == legacy)
         block = standard or legacy
         if block is None:
+            # A row lost ONLY because the screen rejected its cells is the decision-relevant count:
+            # it would have contributed a block before the screen, and that block would have been a
+            # guaranteed refutation. A row that was simply blank was never going to contribute.
+            if name in rows_with_corrupt:
+                rows_excluded.append(name)
             continue
         blocks[name] = ProvidedBlock(
             block=block,
@@ -136,7 +144,13 @@ def necs_gold_blocks(moesm5: Path) -> tuple[dict[str, ProvidedBlock], dict[str, 
             "disagree": both_present - agree,
         },
         "rejected_gold_values": rejected,
-        "n_rows_rejected_for_corrupt_gold": sum(rejected.values()),
+        # Three distinct counts, because a row can carry a corrupt cell in either vintage or both.
+        # The first counts CELLS, so it exceeds the row count when both vintages are corrupt; the
+        # last is the only one that says how many rows actually stopped contributing a block.
+        "n_corrupt_gold_cells": sum(rejected.values()),
+        "n_rows_with_any_corrupt_gold": len(rows_with_corrupt),
+        "n_rows_excluded_by_screen": len(rows_excluded),
+        "rows_excluded_by_screen": sorted(rows_excluded),
         "screen": (
             "candidate keys screened with gold_structure.has_gold_structure, which rejects blanks "
             "and the corrupt '4000' placeholder. An unscreened sentinel becomes a 4-character "
