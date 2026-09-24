@@ -3,6 +3,128 @@
 All notable changes to the `biomapper` Python client are recorded here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-09-24
+
+### Added
+
+- **`biomapper.benchmarks.cross_cohort` and `cross_cohort_certify` - the Monti/NECS cross-cohort
+  arm, finished rather than stubbed.** Phase 2b migrated the 11 external benchmark suite arms but
+  not the cross-cohort machinery, so the arm still had to be run from an engine checkout, which
+  would have pinned its numbers to a different backend than the suite's. These modules close that
+  gap: the whole arm now runs through the package against a deployment, so one provenance story
+  covers the suite, the cohort analyses, and the cross-cohort comparison.
+
+  Ported from the biomapper2 engine at `origin/dev`, commit
+  `1ffb571e54fe028ef0ae4e748fc2e7ec093ee603`:
+
+  - `benchmarks.adapters.cohort_panel` - the arivale / xuetal / llfs / blsa panels, with the
+    exclusion accounting (blank name, unnamed vendor feature, de-duplication) and the
+    `certifiable` determination unchanged.
+  - `benchmarks.scorers.cross_cohort_overlap` - the cohort-shaped linker. It deliberately
+    EXCLUDES `INCHIKEY`, `INCHI` and `SMILES` from the linker: linking on a structure hash would
+    make the downstream structural certificate circular and precision 100% by construction. The
+    comments explaining that are preserved verbatim.
+  - `benchmarks.scorers.link_certificate` and
+    `benchmarks.scorers.independent_link_certificate_overlap` - the KG-independent link
+    certificate, which refuses rather than certifying off a KG-derived structure.
+  - `benchmarks.scorers.arm_b_baseline` - Monti's own published method, reconstructed on the
+    identical row set.
+
+  The driver is rewired from `biomapper2.mapper.Mapper` to
+  `benchmarks.api_mapper.ApiMapper`, exactly as the suite arms were, so provenance names the graph
+  that served the answers instead of a client checkout.
+
+### Changed
+
+- **The Monti published-overlap table is corrected.** `arm_b_baseline.MONTI_PUBLISHED` read
+  `{"arivale": 615, "xuetal": 432, "llfs": 163, "blsa": 99}` and attributed all four values to
+  "Monti Table 2". Re-read against the paper (DOI `10.1007/s11357-026-02174-2`), the citation and
+  two of the four values were wrong:
+
+  - Table 2 is "Age-only markers", not an overlap table. The overlaps are in the Methods section
+    "Datasets harmonization" and in the per-cohort descriptions.
+  - NECS to Xu is **385** in the harmonization methods. The Xu cohort description separately says
+    432, so the paper contradicts itself on this one pair. 385 is used because it comes from the
+    sentence describing the procedure Arm B reconstructs, and that sentence's Arivale value agrees
+    with the Arivale cohort description.
+  - NECS to BLSA is **188**. The old 99 was the BLSA to LLFS overlap ("Ninety-nine metabolites
+    were in common with the LLFS"), a different pair entirely.
+
+  Both the corrected and the superseded tables ship, as `MONTI_PUBLISHED` and
+  `MONTI_PUBLISHED_SUPERSEDED`, with a per-pair quote and section in
+  `MONTI_PUBLISHED_PROVENANCE`, so a changed number is always traceable to a reason.
+
+### Fixed
+
+- **An errored row is no longer indistinguishable from an unresolved one in the cross-cohort
+  path.** Both come back with an empty CURIE set, so folding them together reports a
+  non-resolution that never happened and understates resolution by however many rows the
+  deployment dropped. `cross_cohort.errored_names` counts them apart, `repair_errored_rows`
+  re-maps only the failed rows and writes them back into their original positions, and any row
+  that still errors is reported in the manifest with the affected panel's counts labelled a floor.
+  The deployment did return 5xx under concurrent load during this work, so this is a live hazard.
+
+### Fixed (review round 2)
+
+- **Checkpoints now carry the backend that answered them.** Panels resolve as separate processes and
+  are combined by `--link-only`, which previously fetched `/health` once at finalization and stamped
+  it on every checkpoint. A deployment or graph-build change between panel runs would then present a
+  mixed-backend result as one pinned run. Each panel writes a provenance sidecar at resolve time, and
+  finalization compares `endpoint`, `kestrel_version`, `kg_version`, `biolink_version`,
+  `build_timestamp` and `git_commit` per panel. A mismatch, or a checkpoint with no sidecar at all,
+  raises `BackendDriftError`. `--allow-unpinned-checkpoints` is an explicit escape that records the
+  gap in the manifest instead of letting the run read as pinned.
+- **A missing per-pair link artifact no longer reads as zero links.** `manifest.json` existing does
+  not imply the artifacts do. `read_links` raises `MissingLinkArtifactError`, and each link file's
+  row count is cross-checked against the manifest's `arm_m_links`.
+- **A transient PubChem failure is no longer overwritten by a clean fallback miss.** A `lookup_failed`
+  on the CID route followed by a `clean_miss` on the HMDB route previously reported a retryable run
+  artifact as a genuine coverage gap. The failure is sticky unless a fallback actually resolves.
+
+### Added (review round 2)
+
+- **`biomapper.benchmarks.cross_cohort_readjudicate`.** Every non-certified case is checked against
+  PubChem's name index, which is a different lookup than either side of the certificate used. A
+  first-block mismatch is classified as a tautomer, charge or salt artifact only when the outside
+  source corroborates BOTH sides and their heavy-atom compositions match with a mass gap consistent
+  with the hydrogen-count difference. Outcomes separate `necs_gold_suspect` from `cohort_id_suspect`
+  from `genuine_structural_disagreement` from `outside_source_unresolved`, so a refusal that could
+  not be checked is never folded into one that was.
+
+### Fixed (review round 3, from the first live panel)
+
+- **The client commit is captured at run start, not at sidecar write.** The first live panel exposed
+  this: a sidecar is written when its panel finishes, 29 minutes after launch here, and the working
+  tree was being read at that moment. The sidecar therefore named a commit that was not the code the
+  process had loaded. A provenance record naming the wrong code is worse than one naming none,
+  because it looks authoritative. The late-capture path remains as a fallback but labels itself.
+- **An identical molecular formula is no longer called a tautomer artifact.** `composition_relation`
+  replaces a boolean that treated same-formula-different-first-block as an artifact. It is not
+  decidable that way: Pro-Leu against Leu-Pro, and leucine against isoleucine, share a formula and a
+  mass while being genuinely different molecules, and keto-enol tautomers also share a hydrogen
+  count. Since the first block IS the connectivity hash, that case is equally a tautomer and a
+  constitutional isomer. Only a hydrogen-count difference confirmed by the mass gap is now called
+  `charge_or_protonation_artifact`; the ambiguous case becomes
+  `same_formula_different_connectivity` and says it must not be counted in either direction.
+- **`outside_source_hit_a_derivative` is a named outcome.** Observed live: production resolved the
+  LLFS row "Prolylleucine" to `RM:0137550` (block `ZKQOUHVVXABNDG`, CID 3527720, C11H20N2O3, the free
+  Pro-Leu dipeptide) and the API certificate marked it `contradicted` because its own external
+  fallback returned `YCYXUKRYYSXSLJ` (CID 3584406, Cbz-protected Z-Pro-Leu, C19H26N2O5). BioMapper
+  was right and the certificate's independent source was wrong, because PubChem's name index ranks
+  protected forms above free peptides. Detected by a containing formula plus a mass gap over 50 Da.
+
+### Notes
+
+- Cohorts that ship names only (NECS, Xu, LLFS, BLSA have no vendor identifier column) are
+  `certifiable=False`. Their links are countable but never structurally certifiable, and
+  `cross_cohort_certify` reports that as refused **by construction**, not as an uncertified
+  failure. Only Arivale carries structure-resolvable vendor identifiers in this arm.
+- Every certificate verdict here is an InChIKey **first block** comparison, which is neither
+  tautomer- nor charge-invariant: it over-flags tautomers as refuted and silently accepts a
+  stereoisomer error whenever a side lacks the stereo layer. `stereo_checked` records which
+  happened. The NECS curated gold also carries roughly 5% InChIKey errors, so a refuted verdict is
+  a candidate for re-adjudication against an outside source, not a finding on its own.
+
 ## [1.4.0] - 2026-09-23
 
 ### Added
