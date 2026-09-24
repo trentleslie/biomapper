@@ -63,11 +63,22 @@ class PubChemInChIKeyResolver:
     (b)'s independence). Cached + IPv4-forced + fail-soft (unresolved -> ``None``).
     """
 
-    def __init__(self, *, timeout: float = 20.0, session: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = 20.0,
+        session: Any | None = None,  # noqa: ANN401
+        pacer: Any | None = None,  # noqa: ANN401 - a biomapper.benchmarks.pacing.Pacer
+    ) -> None:
         import requests
 
         self._timeout = timeout
         self._session = session or requests.Session()
+        # Optional request pacer, consulted in ``_resolve_txt`` — i.e. on the REQUEST path, which
+        # only runs after ``_cached_resolve`` has missed. Pacing outside the resolver cannot know
+        # whether a request is about to be sent, so it sleeps on cache hits too. Default None keeps
+        # the suite's existing behaviour unchanged.
+        self._pacer = pacer
         self._cache: dict[str, str | None] = {}
         self._status_cache: dict[str, tuple[str | None, str]] = {}
 
@@ -77,6 +88,8 @@ class PubChemInChIKeyResolver:
         status: ``success`` (block found), ``clean_miss`` (404 / empty body = no such structure),
         ``lookup_failed`` (5xx / network error = transient; must NOT be read as absence).
         """
+        if self._pacer is not None:
+            self._pacer.wait()
         url = f"{_PUG_REST}/{path}"
         try:
             with force_ipv4():

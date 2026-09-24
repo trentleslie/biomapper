@@ -295,6 +295,7 @@ class OutsideResolver:
         # bank a refusal the service would not have given a minute later.
         if cached is not None and cached.status != "lookup_failed":
             return cached
+        # Already past the cache check in :meth:`_resolve`, so this is the request path.
         self._pacer.wait()
         url = f"{_PUG_REST}/{path}/property/{PROPERTIES}/JSON"
         try:

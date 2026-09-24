@@ -3,6 +3,23 @@
 All notable changes to the `biomapper` Python client are recorded here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-09-24
+
+### Fixed
+
+- **PubChem pacing now fires on the request path, not on cache hits.** `cross_cohort_certify` called
+  `Pacer.wait()` at the call site, immediately before `_cached_resolve`, so it slept and advanced the
+  pacing clock even when the resolver answered from cache. The cohort panel de-duplicates on NAME,
+  not on identifier, so distinct names can share a PubChem CID or HMDB accession; each repeat cost up
+  to a full interval without issuing a request and delayed the next real lookup on top.
+
+  `PubChemInChIKeyResolver` now takes an optional pacer and consults it inside `_resolve_txt`, which
+  runs only after `_cached_resolve` has missed. Default `None` leaves the suite unchanged. This is
+  what `Pacer`'s own docstring already prescribed ("only on a cache miss") and what the
+  re-adjudication resolver already did.
+
+  Performance only: no count, verdict or published number changes.
+
 ## [1.5.1] - 2026-09-24
 
 ### Fixed
