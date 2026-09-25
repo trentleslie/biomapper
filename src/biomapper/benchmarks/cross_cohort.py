@@ -66,6 +66,7 @@ from biomapper.benchmarks.scorers.arm_b_baseline import (
     MONTI_PUBLISHED,
     MONTI_PUBLISHED_PROVENANCE,
     MONTI_PUBLISHED_SUPERSEDED,
+    MONTI_S03_DERIVED,
     PAIR_METHOD,
     arm_b_overlap,
 )
@@ -681,6 +682,7 @@ def run_links(
             "monti_published": published,
             "monti_published_provenance": MONTI_PUBLISHED_PROVENANCE[cohort],
             "monti_published_superseded_value": MONTI_PUBLISHED_SUPERSEDED[cohort],
+            "monti_s03_derived": MONTI_S03_DERIVED.get(cohort),
             "arm_b_gap_to_published": derived.count - published,
             "arm_m_vs_arm_b": overlap.n_a_linked - derived.count,
             "arm_m_vs_published": overlap.n_a_linked - published,
