@@ -1018,3 +1018,22 @@ def test_repair_still_runs_for_a_confirmed_checkpoint(tmp_path):
     )
     assert pin["status"] == "match"
     assert repair.get("skipped") is None and repair["recovered"] == 1
+
+
+def test_the_manifest_source_note_agrees_with_the_per_pair_provenance():
+    """A run record must not carry two different accounts of where its comparator came from.
+
+    The manifest-level note once said the overlaps came from the Methods prose and "NOT Table 2",
+    while the per-cohort provenance cited the supplement's "Table 2. Datasets". Both appeared in the
+    same record, which makes the corrected Xu and BLSA values unauditable.
+    """
+    import inspect
+
+    import biomapper.benchmarks.cross_cohort as module
+
+    source = inspect.getsource(module.main)
+    assert "supplement MOESM6, sheet 'Table 2. Datasets'" in source
+    # The prose is named as what the values are NOT read from, and the two Table 2s are kept apart.
+    assert "published_overlaps_NOT_read_from" in source
+    for cohort in ("arivale", "xuetal", "llfs", "blsa"):
+        assert "MOESM6" in str(MONTI_PUBLISHED_PROVENANCE[cohort]["source"])
