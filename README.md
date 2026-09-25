@@ -25,11 +25,14 @@ pip install biomapper
 pip install 'biomapper[benchmarks]'
 ```
 
-**1.5.2 is the first release on PyPI that contains the benchmark suite.** Earlier published
-releases, up to and including 1.4.0, ship neither `biomapper.benchmarks` nor the `benchmarks`
-extra, so `pip install 'biomapper[benchmarks]'` against them warns that the extra is unknown and
-installs only the core client. The changelog records which versions reached the index; 1.5.0 and
-1.5.1 are tagged *(not published)*.
+**Use 1.5.3 or later for the benchmark suite.** Earlier published releases, up to and including
+1.4.0, ship neither `biomapper.benchmarks` nor the `benchmarks` extra, so
+`pip install 'biomapper[benchmarks]'` against them warns that the extra is unknown and installs
+only the core client. 1.5.2 contains the suite but its extras were published **empty**, so the
+same command installs the core client without pandas, requests, rdkit, openpyxl or defusedxml and
+the suite fails on first import; install those by hand if you are pinned to 1.5.2. 1.5.3 is the
+first release whose `benchmarks` extra actually carries its dependencies. The changelog records
+which versions reached the index; 1.5.0 and 1.5.1 are tagged *(not published)*.
 
 ---
 

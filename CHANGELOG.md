@@ -3,6 +3,36 @@
 All notable changes to the `biomapper` Python client are recorded here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] - 2026-09-25
+
+### Fixed
+
+- **The `benchmarks` extra shipped empty in 1.5.2 and now carries its dependencies.**
+  `pip install 'biomapper[benchmarks]==1.5.2'` installed the core client and nothing else, so
+  `python -m biomapper.benchmarks all` failed on the first `import pandas`. All four extras were
+  affected (`metabolon`, `notebook`, `benchmarks`, `all`).
+
+  Cause: the extras were declared correctly in `[tool.poetry.extras]`, but the packages they name
+  were declared only in `[tool.poetry.group.*.dependencies]`. Poetry groups are a local development
+  concept and are never written into wheel metadata, so the published 1.5.2 wheel carried
+  `Provides-Extra: benchmarks` with **no** `Requires-Dist` gated on any extra. The optional
+  dependencies now live in `[tool.poetry.dependencies]` with `optional = true`, which is the only
+  place Poetry reads them from when building extras, and the three redundant feature groups are
+  removed.
+
+  Verified against the built wheel rather than the local environment: 1.5.3 metadata carries
+  `pandas`, `openpyxl`, `requests`, `rdkit` and `defusedxml` each gated on
+  `extra == "benchmarks" or extra == "all"`, and a clean `--target` install of
+  `biomapper-1.5.3-py3-none-any.whl[benchmarks]` resolves all five from the install tree.
+
+  **Why CI did not catch it, which is the part worth remembering.** `poetry install --all-extras`
+  also installs every non-optional group, so the group declarations satisfied the test suite while
+  the published artifact was broken. Green CI was actively misleading: it exercised a dependency
+  shape that no installing user could obtain. `tests/test_packaging_extras.py` now reads
+  `pyproject.toml` directly, which is the artifact that governs publishing, and fails if an extra
+  names a package that is not an optional main dependency. Those tests fail 8 of 12 against the
+  1.5.2 configuration.
+
 **Published to PyPI:** 0.1.0 through 1.4.0, and 1.5.2. Entries tagged *(not published)* were
 version bumps that landed in this repository but were never uploaded to the release index, so
 `pip install biomapper==<that version>` will not resolve. This matters for any claim about which
