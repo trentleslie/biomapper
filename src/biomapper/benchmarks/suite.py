@@ -283,15 +283,24 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         "",
         "## Arms",
         "",
-        "| arm | status | role | note |",
-        "|---|---|---|---|",
+        "| arm | status | label | declared role | note |",
+        "|---|---|---|---|---|",
     ]
     for entry in manifest["datasets"]:
-        role = entry.get("role") or (manifest["circularity"].get(entry["dataset"], {}) or {}).get(
-            "label", ""
-        )
+        # The CIRCULARITY label wins. It is derived per run from the build's own ingested-source
+        # list, whereas ``role`` is a static field on the dataset config that DEFAULTS to
+        # "accuracy". Letting role win meant this table called RefMet "accuracy" while the
+        # manifest's own circularity register called it "coverage", on the one arm the July
+        # independence audit singled out. Both are shown so a disagreement is visible rather than
+        # resolved silently in favour of the more flattering one.
+        circ = (manifest["circularity"].get(entry["dataset"], {}) or {}).get("label", "")
+        declared = entry.get("role") or ""
+        flag = " **(disagrees)**" if circ and declared and circ != declared else ""
         note = entry.get("reason") or entry.get("error") or ""
-        lines.append(f"| {entry['dataset']} | {entry['status']} | {role} | {note} |")
+        lines.append(
+            f"| {entry['dataset']} | {entry['status']} | {circ or declared} | "
+            f"{declared or 'n/a'}{flag} | {note} |"
+        )
     lines += [
         "",
         "## Reading these numbers",
@@ -304,6 +313,27 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         "- A `skipped` arm has a reason. It is not a zero and not a pass.",
         "- A `partial` arm completed some sub-arms and not others. Its numbers cover only what",
         "  completed, so they are not the full benchmark.",
+        "- Where `label` and `declared role` disagree, trust `label`: it is derived per run from",
+        "  this build's own ingested-source list, while `declared role` is a static config field",
+        "  that defaults to `accuracy`.",
+        "",
+        "## Which structure number is 'strict'",
+        "",
+        "Structure-oracle arms report three figures on the same scored rows. They are NOT",
+        "interchangeable, and one of them is the published one:",
+        "",
+        "- `comparable_core_strict_kg_only` is **the published strict figure**. The chosen node's",
+        "  own InChIKey matched. A row whose structure came from the external name lookup is a",
+        "  miss, because the graph did not supply it.",
+        "- `comparable_core` is the same measurement with a Metabolomics Workbench or PubChem",
+        "  lookup on the node's NAME allowed to fill in a structure-less node. Report it as the",
+        "  name-fallback variant in a methods note. It is **not** 'strict', though it was the",
+        "  headline historically, which is how one word came to mean two numbers.",
+        "- `comparable_core_kg_equivalence_set` counts a match against ANY connectivity the node",
+        "  asserts, so it is partly a measure of the graph's curation.",
+        "",
+        "Each carries `definition` and `is_published_strict` so the distinction survives being",
+        "read out of the JSON by someone who was not in the decision.",
         "",
         f"Generated {dt.datetime.now(dt.UTC).isoformat()}.",
     ]

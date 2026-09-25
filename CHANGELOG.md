@@ -3,6 +3,36 @@
 All notable changes to the `biomapper` Python client are recorded here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The suite now names which structure figure is the published "strict" one.** Hajjar-100 scores
+  92/100 on the KG record alone and 95/100 when an external Metabolomics Workbench or PubChem
+  lookup on the node's NAME is allowed to fill in a structure-less node. The suite reported the
+  second as `comparable_core`, its headline, while the independence audit defined published strict
+  as the first. Both were emitted under the metric name `top1_accuracy`, so nothing in the artifact
+  told a reader which definition they were holding, and quoting the headline as "strict" silently
+  changed the metric between documents.
+
+  `comparable_core_strict_kg_only` is new and is the published strict figure (decided 2026-09-23).
+  It is computed in-run rather than derived by hand from `per_row`. Verified against the real
+  2026-09-24 Hajjar artifact: 92/100, against `comparable_core` 95/100 and equivalence-set 95/100.
+
+  Every variant now carries a `definition` string and an `is_published_strict` boolean, the metric
+  names are distinct (`top1_accuracy_strict_kg_only` against `top1_accuracy_with_name_fallback`),
+  and a test asserts exactly one variant claims to be the published strict figure. Nothing is
+  removed: `comparable_core` keeps its key and its value, so existing readers are unaffected.
+
+### Fixed
+
+- **The run README no longer calls a coverage arm "accuracy".** The arm table resolved its label as
+  `role or circularity_label`, and `role` is a static config field that DEFAULTS to `"accuracy"`.
+  The table therefore called RefMet accuracy while the same run's `circularity` register called it
+  coverage, on the one arm the July independence audit singled out as the at-risk case. The
+  per-run circularity label now wins, the declared role is shown beside it, and a disagreement is
+  flagged in the row rather than resolved silently in favour of the more flattering reading.
+
 ## [1.5.3] - 2026-09-25
 
 ### Fixed
