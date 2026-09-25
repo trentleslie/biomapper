@@ -226,6 +226,41 @@ def run_suite(
     return {"out_dir": str(suite_dir), "manifest": manifest, "results": results}
 
 
+# How strong a claim each label makes, weakest first. Used to reconcile the two label sources.
+CLAIM_STRENGTH: dict[str, int] = {
+    "coverage": 0,
+    "capability_regression": 0,
+    "partly_circular": 1,
+    "accuracy_candidate": 2,
+    "accuracy": 3,
+}
+
+
+def weakest_claim(declared: str, circularity: str) -> str:
+    """Reconcile the arm's declared role with the per-run circularity verdict, conservatively.
+
+    Two sources disagree for opposite reasons and neither can simply win.
+
+    ``role`` is a static config field that DEFAULTS to ``"accuracy"``, so it overstates whenever an
+    arm's author did not set it: that is how the README called RefMet accuracy while the same run's
+    circularity register called it coverage.
+
+    But ``circularity`` only asks whether the arm's gold source is ingested into the graph. It
+    cannot see an arm that is coverage *by construction* regardless of provenance, such as
+    MetaboliteAnnotator, whose headline is a name-hit rate that measures whether an identifier was
+    produced rather than whether it was right. For that arm circularity reports
+    ``accuracy_candidate`` while the runner correctly declares ``coverage``.
+
+    So take the WEAKER claim. Overstating a coverage number as accuracy is the error that actually
+    misleads a reader; understating an accuracy number is merely conservative. Unknown labels sort
+    as the weakest, because an unrecognized label is not evidence for a strong claim.
+    """
+    candidates = [label for label in (declared, circularity) if label]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda label: CLAIM_STRENGTH.get(label, -1))
+
+
 def _headline(record: dict[str, Any]) -> dict[str, Any]:
     """The arm's quotable numbers, extracted for the aggregate manifest.
 
@@ -235,6 +270,12 @@ def _headline(record: dict[str, Any]) -> dict[str, Any]:
     """
     result = record.get("results") or {}
     out: dict[str, Any] = {"role": record.get("role")}
+    # The published strict figure comes FIRST and is carried unconditionally. Omitting it here
+    # while the adjacent README advertises it would leave a reader of the aggregate manifest
+    # unable to retrieve the one number the report tells them to quote.
+    strict = result.get("comparable_core_strict_kg_only")
+    if isinstance(strict, dict):
+        out["comparable_core_strict_kg_only"] = strict
     core = result.get("comparable_core")
     if isinstance(core, dict):
         out["comparable_core"] = core
@@ -287,18 +328,12 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         "|---|---|---|---|---|",
     ]
     for entry in manifest["datasets"]:
-        # The CIRCULARITY label wins. It is derived per run from the build's own ingested-source
-        # list, whereas ``role`` is a static field on the dataset config that DEFAULTS to
-        # "accuracy". Letting role win meant this table called RefMet "accuracy" while the
-        # manifest's own circularity register called it "coverage", on the one arm the July
-        # independence audit singled out. Both are shown so a disagreement is visible rather than
-        # resolved silently in favour of the more flattering one.
         circ = (manifest["circularity"].get(entry["dataset"], {}) or {}).get("label", "")
         declared = entry.get("role") or ""
         flag = " **(disagrees)**" if circ and declared and circ != declared else ""
         note = entry.get("reason") or entry.get("error") or ""
         lines.append(
-            f"| {entry['dataset']} | {entry['status']} | {circ or declared} | "
+            f"| {entry['dataset']} | {entry['status']} | {weakest_claim(declared, circ)} | "
             f"{declared or 'n/a'}{flag} | {note} |"
         )
     lines += [

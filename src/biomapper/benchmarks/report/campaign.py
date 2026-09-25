@@ -31,6 +31,20 @@ CAMPAIGN_FRAMING = (
 )
 
 
+def _strict_core(result: dict[str, Any]) -> dict[str, Any]:
+    """The figure that belongs under a column headed "strict".
+
+    ``comparable_core`` is the name-fallback variant. Reading it under a "Top-1 (strict)" heading
+    is how one word came to mean two numbers: on Hajjar-100 it is 95/100 where the published
+    strict figure is 92/100. Prefer ``comparable_core_strict_kg_only`` and fall back only for
+    artifacts written before that field existed, where ``comparable_core`` is all there is.
+    """
+    strict = result.get("comparable_core_strict_kg_only")
+    if isinstance(strict, dict):
+        return strict
+    return result["comparable_core"]
+
+
 def _pct(x: float | None) -> str:
     return "n/a" if x is None else f"{x * 100:.1f}%"
 
@@ -75,7 +89,7 @@ def _name_source_regime_rows(entry: dict[str, Any]) -> list[str]:
     rows: list[str] = []
     for k in keys:
         r = by[k]
-        core = r["comparable_core"]
+        core = _strict_core(r)
         cn = r.get("comparable_core_charge_normalized")
         cn_acc = _pct(cn["top1_accuracy"]) if cn else "n/a"
         cov = r.get("coverage", {})
@@ -87,7 +101,7 @@ def _name_source_regime_rows(entry: dict[str, Any]) -> list[str]:
 
 
 def _metabolite_row(entry: dict[str, Any]) -> str:
-    core = entry["result"]["comparable_core"]
+    core = _strict_core(entry["result"])
     cn = entry["result"].get("comparable_core_charge_normalized")
     cn_acc = _pct(cn["top1_accuracy"]) if cn else "n/a"
     cov = entry["result"]["coverage"]
@@ -183,7 +197,9 @@ def assemble_campaign_report(
     if curie_entries:
         lines.append("## Gene/protein arm — CURIE-equality accuracy (one number per dataset)")
         lines.append("")
-        lines.append("| Dataset | Arm | Top-1 accuracy | Scored n | Coverage | Precision | Recall | F1 |")
+        lines.append(
+            "| Dataset | Arm | Top-1 accuracy | Scored n | Coverage | Precision | Recall | F1 |"
+        )
         lines.append("|---|---|---|---|---|---|---|---|")
         for entry in curie_entries:
             lines.append(_curie_row(entry))
@@ -212,8 +228,12 @@ def assemble_campaign_report(
 
     lines.append("## Notes")
     lines.append("")
-    lines.append("- No published same-set competitor exists for NECS or the backbones — no competitor figure is drawn.")
-    lines.append("- Per-vocab breakdown is intentionally omitted (annotation-driven, not vocab-steered).")
+    lines.append(
+        "- No published same-set competitor exists for NECS or the backbones — no competitor figure is drawn."
+    )
+    lines.append(
+        "- Per-vocab breakdown is intentionally omitted (annotation-driven, not vocab-steered)."
+    )
     lines.append(f"- Reconciliation passed: {integrity.get('reconciliation_passed')}")
     lines.append(f"- Validation passed: {integrity.get('validation_passed')}")
     lines.append("")

@@ -23,6 +23,29 @@ from biomapper.benchmarks.config import DatasetConfig
 
 CHOSEN_COL = "chosen_kg_id"
 
+# The wording each reported variant carries, defined once. The blended figures and the per-regime
+# breakout both emit these; duplicating the strings is how two copies of "what this measures" end
+# up disagreeing, which is the exact failure this metadata exists to prevent.
+STRICT_KG_ONLY_DEFINITION = (
+    "the chosen KG node's own InChIKey matched the held-out gold. A row whose structure came from "
+    "the Metabolomics Workbench or PubChem name fallback is a MISS here, because the graph did not "
+    "supply the structure."
+)
+NAME_FALLBACK_DEFINITION = (
+    "structure taken from the chosen node's InChIKey when present, otherwise from a Metabolomics "
+    "Workbench or PubChem lookup on the node's NAME. Report this as the name-fallback variant in a "
+    "methods note, never as 'strict'."
+)
+CHARGE_NORMALIZED_DEFINITION = (
+    "both sides neutralized for charge and protonation before comparing connectivity. Reported "
+    "beside the strict figure, never in place of it."
+)
+KG_EQUIVALENCE_SET_DEFINITION = (
+    "gold matches ANY InChIKey first-block the chosen node asserts, not only the first. Partly a "
+    "measure of the graph's curation rather than of resolution alone, because a node asserting "
+    "several connectivities satisfies this more easily."
+)
+
 # ------------------------------------------------------------------------------------------------
 # Name-source regimes (LMSD lipid arm — two-regime split).
 #
@@ -249,6 +272,7 @@ def score_structure_oracle(
                     "n_predicted": 0,
                     "scored": 0,
                     "correct": 0,
+                    "strict": 0,
                     "cn_scored": 0,
                     "cn_correct": 0,
                 },
@@ -260,6 +284,8 @@ def score_structure_oracle(
                 t["scored"] += 1
                 if is_correct:
                     t["correct"] += 1
+                    if not needed_fallback:
+                        t["strict"] += 1
             if cn_correct_row is not None:  # row is in the charge-normalized scored set
                 t["cn_scored"] += 1
                 if cn_correct_row:
@@ -287,6 +313,8 @@ def score_structure_oracle(
             "top1_accuracy": (cn_correct / cn_scored) if cn_scored else None,
             "correct": cn_correct,
             "scored_denominator": cn_scored,
+            "definition": CHARGE_NORMALIZED_DEFINITION,
+            "is_published_strict": False,
         }
     else:
         cn_core = None
@@ -297,11 +325,7 @@ def score_structure_oracle(
             "top1_accuracy": (eq_correct / eq_scored) if eq_scored else None,
             "correct": eq_correct,
             "scored_denominator": eq_scored,
-            "definition": (
-                "gold matches ANY InChIKey first-block the chosen node asserts, not only the "
-                "first. Partly a measure of the graph's curation rather than of resolution alone, "
-                "because a node asserting several connectivities satisfies this more easily."
-            ),
+            "definition": KG_EQUIVALENCE_SET_DEFINITION,
             "is_published_strict": False,
         }
     else:
@@ -321,13 +345,25 @@ def score_structure_oracle(
                     "top1_accuracy": (t["cn_correct"] / t["cn_scored"]) if t["cn_scored"] else None,
                     "correct": t["cn_correct"],
                     "scored_denominator": t["cn_scored"],
+                    "definition": CHARGE_NORMALIZED_DEFINITION,
+                    "is_published_strict": False,
                 }
             by_regime[regime] = {
+                "comparable_core_strict_kg_only": {
+                    "metric": "top1_accuracy_strict_kg_only",
+                    "top1_accuracy": (t["strict"] / t["scored"]) if t["scored"] else None,
+                    "correct": t["strict"],
+                    "scored_denominator": t["scored"],
+                    "definition": STRICT_KG_ONLY_DEFINITION,
+                    "is_published_strict": True,
+                },
                 "comparable_core": {
-                    "metric": "top1_accuracy",
+                    "metric": "top1_accuracy_with_name_fallback",
                     "top1_accuracy": (t["correct"] / t["scored"]) if t["scored"] else None,
                     "correct": t["correct"],
                     "scored_denominator": t["scored"],
+                    "definition": NAME_FALLBACK_DEFINITION,
+                    "is_published_strict": False,
                 },
                 "comparable_core_charge_normalized": regime_cn,
                 "n_rows": t["n_rows"],
@@ -349,11 +385,7 @@ def score_structure_oracle(
             "top1_accuracy": (strict_kg_only_correct / scored) if scored else None,
             "correct": strict_kg_only_correct,
             "scored_denominator": scored,
-            "definition": (
-                "the chosen KG node's own InChIKey matched the held-out gold. A row whose "
-                "structure came from the Metabolomics Workbench or PubChem name fallback is a "
-                "MISS here, because the graph did not supply the structure."
-            ),
+            "definition": STRICT_KG_ONLY_DEFINITION,
             "is_published_strict": True,
         },
         # The SAME measurement with the external name fallback allowed. Historically the headline,
@@ -363,11 +395,7 @@ def score_structure_oracle(
             "top1_accuracy": accuracy,
             "correct": correct,
             "scored_denominator": scored,
-            "definition": (
-                "structure taken from the chosen node's InChIKey when present, otherwise from a "
-                "Metabolomics Workbench or PubChem lookup on the node's NAME. Report this as the "
-                "name-fallback variant in a methods note, never as 'strict'."
-            ),
+            "definition": NAME_FALLBACK_DEFINITION,
             "is_published_strict": False,
         },
         "comparable_core_charge_normalized": cn_core,

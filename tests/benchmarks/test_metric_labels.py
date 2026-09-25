@@ -151,3 +151,84 @@ def test_a_wrong_fallback_answer_is_a_miss_under_both() -> None:
     result = score_structure_oracle(df, _Config(), oracle, vocab="CHEBI")
     assert result["comparable_core_strict_kg_only"]["correct"] == 0
     assert result["comparable_core"]["correct"] == 0
+
+
+# ------------------------------------------------------------------------------------------------
+# Greptile round 1 on PR #14: four ways the labelling was still incomplete.
+# ------------------------------------------------------------------------------------------------
+
+
+def test_every_emitted_variant_carries_the_metadata() -> None:
+    """The README promises `definition` and `is_published_strict` on each figure. Check them ALL.
+
+    The first pass only added them to the two principal figures, so the charge-normalized and
+    per-regime variants silently lacked the fields the report told readers to rely on.
+    """
+    df = pd.DataFrame(
+        {
+            "name": ["a", "b"],
+            "gold_inchikey": ["AAAAAAAAAAAAAA-UHFFFAOYSA-N", "BBBBBBBBBBBBBB-UHFFFAOYSA-N"],
+            "gold_smiles": ["CCO", "CC(=O)O"],
+            "query_source": ["abbreviation", "common_name"],
+            CHOSEN_COL: ["KG:a", "KG:b"],
+        }
+    )
+
+    class _CnOracle(_Oracle):
+        def neutral_block(self, node_id: str) -> str | None:
+            return self._kg.get(node_id)
+
+    class _CnConfig(_Config):
+        gold_smiles_column = "gold_smiles"
+
+    result = score_structure_oracle(
+        df,
+        _CnConfig(),
+        _CnOracle(kg_records={"KG:a": "AAAAAAAAAAAAAA", "KG:b": "BBBBBBBBBBBBBB"}, fallback={}),
+        vocab="CHEBI",
+        gold_smiles_normalizer=lambda s: {"CCO": "AAAAAAAAAAAAAA", "CC(=O)O": "BBBBBBBBBBBBBB"}.get(
+            str(s)
+        ),
+        name_source_column="query_source",
+    )
+
+    checked = 0
+    for key in (
+        "comparable_core_strict_kg_only",
+        "comparable_core",
+        "comparable_core_charge_normalized",
+        "comparable_core_kg_equivalence_set",
+    ):
+        figure = result.get(key)
+        if figure is None:
+            continue
+        assert figure.get("definition", "").strip(), f"{key} has no definition"
+        assert "is_published_strict" in figure, f"{key} does not say whether it is strict"
+        checked += 1
+    assert checked >= 3
+
+    for regime, block in (result["by_name_source_regime"] or {}).items():
+        for key in ("comparable_core_strict_kg_only", "comparable_core"):
+            figure = block.get(key)
+            assert figure is not None, f"{regime} missing {key}"
+            assert figure.get("definition", "").strip(), f"{regime}.{key} has no definition"
+            assert "is_published_strict" in figure, f"{regime}.{key} does not say"
+
+
+def test_per_regime_blocks_expose_the_strict_figure() -> None:
+    """A per-regime breakout that only carries the fallback figure repeats the original bug."""
+    df = pd.DataFrame(
+        {
+            "name": ["a", "b"],
+            "gold_inchikey": ["AAAAAAAAAAAAAA-UHFFFAOYSA-N", "BBBBBBBBBBBBBB-UHFFFAOYSA-N"],
+            "query_source": ["abbreviation", "abbreviation"],
+            CHOSEN_COL: ["KG:a", "KG:b"],
+        }
+    )
+    oracle = _Oracle(kg_records={"KG:a": "AAAAAAAAAAAAAA"}, fallback={"KG:b": "BBBBBBBBBBBBBB"})
+    result = score_structure_oracle(
+        df, _Config(), oracle, vocab="CHEBI", name_source_column="query_source"
+    )
+    block = (result["by_name_source_regime"] or {})["shorthand"]
+    assert block["comparable_core_strict_kg_only"]["correct"] == 1
+    assert block["comparable_core"]["correct"] == 2
