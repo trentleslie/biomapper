@@ -33,6 +33,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   names a package that is not an optional main dependency. Those tests fail 8 of 12 against the
   1.5.2 configuration.
 
+  A source-level check is still not sufficient on its own, so CI now also inspects the BUILT wheel
+  via `scripts/check_wheel_extras.py`. A future change to the build backend or to Poetry could
+  reproduce the same symptom from a different cause and leave a config-only test green. Run against
+  the real 1.5.2 wheel the checker reports all four extras as gating no requirements and exits 1.
+
 **Published to PyPI:** 0.1.0 through 1.4.0, and 1.5.2. Entries tagged *(not published)* were
 version bumps that landed in this repository but were never uploaded to the release index, so
 `pip install biomapper==<that version>` will not resolve. This matters for any claim about which

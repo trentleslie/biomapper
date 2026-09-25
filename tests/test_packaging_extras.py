@@ -21,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 
 def _pyproject() -> dict:
@@ -103,6 +104,61 @@ def test_all_extra_is_the_union_of_the_others() -> None:
     )
 
 
+def _make_wheel(tmp_path: Path, metadata: str) -> Path:
+    """A minimal wheel carrying just the METADATA the checker reads."""
+    import zipfile
+
+    wheel = tmp_path / "biomapper-0.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr("biomapper-0.0.0.dist-info/METADATA", metadata)
+    return wheel
+
+
+def _run_checker(wheel: Path) -> int:
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "check_wheel_extras.py"
+    spec = importlib.util.spec_from_file_location("check_wheel_extras", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return int(module.main(["check_wheel_extras.py", str(wheel)]))
+
+
+def test_wheel_checker_rejects_an_empty_extra(tmp_path: Path) -> None:
+    """The 1.5.2 shape: extras advertised, nothing gated on them.
+
+    This is the exact artifact that shipped, reconstructed, so the checker is proven against the
+    failure rather than only against the fix.
+    """
+    metadata = (
+        "Metadata-Version: 2.1\nName: biomapper\nVersion: 0.0.0\n"
+        "Provides-Extra: benchmarks\n"
+        "Requires-Dist: httpx (>=0.27,<0.28)\n"
+    )
+    assert _run_checker(_make_wheel(tmp_path, metadata)) == 1
+
+
+def test_wheel_checker_rejects_a_partially_populated_extra(tmp_path: Path) -> None:
+    """An extra that gates some but not all of its declared packages must also fail."""
+    metadata = (
+        "Metadata-Version: 2.1\nName: biomapper\nVersion: 0.0.0\n"
+        "Provides-Extra: benchmarks\n"
+        'Requires-Dist: pandas (>=2.0,<3.0) ; extra == "benchmarks"\n'
+    )
+    assert _run_checker(_make_wheel(tmp_path, metadata)) == 1
+
+
+def test_wheel_checker_accepts_a_fully_gated_extra(tmp_path: Path) -> None:
+    """And it must pass when every declared package is gated, or it is useless."""
+    lines = ["Metadata-Version: 2.1", "Name: biomapper", "Version: 0.0.0"]
+    for extra, packages in _extras().items():
+        lines.append(f"Provides-Extra: {extra}")
+        for pkg in packages:
+            lines.append(f'Requires-Dist: {pkg} ; extra == "{extra}"')
+    assert _run_checker(_make_wheel(tmp_path, "\n".join(lines) + "\n")) == 0
+
+
 def test_core_install_stays_light() -> None:
     """The non-optional dependency set must stay small.
 
@@ -116,6 +172,8 @@ def test_core_install_stays_light() -> None:
         for name, spec in main.items()
         if name != "python" and not (isinstance(spec, dict) and spec.get("optional", False))
     }
-    assert mandatory == {"httpx", "pydantic", "python-dotenv"}, (
-        f"core dependency set changed to {sorted(mandatory)}; heavy packages must stay optional"
-    )
+    assert mandatory == {
+        "httpx",
+        "pydantic",
+        "python-dotenv",
+    }, f"core dependency set changed to {sorted(mandatory)}; heavy packages must stay optional"
