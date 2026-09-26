@@ -24,6 +24,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a test asserts exactly one variant claims to be the published strict figure. Nothing is
   removed: `comparable_core` keeps its key and its value, so existing readers are unaffected.
 
+  For an artifact written before that field existed, the campaign report RECOMPUTES the strict
+  figure from `per_row` (correct and not `needed_fallback`) rather than substituting
+  `comparable_core`. Substituting it would print the name-fallback number under a "Top-1 (strict)"
+  heading, which is the confusion being fixed. Where neither the field nor `per_row` is available
+  the cell reads `n/a (strict not in artifact)`: a blank cell reads as zero, and a wrong number
+  under a strict heading is unrecoverable. Verified on the real 2026-09-25 Hajjar artifact, which
+  predates the field: recomputation returns 92/100, matching the hand-derived figure, against a
+  stored `comparable_core` of 95/100.
+
 ### Fixed
 
 - **The run README no longer calls a coverage arm "accuracy".** The arm table resolved its label as

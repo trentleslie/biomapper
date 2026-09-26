@@ -261,6 +261,38 @@ def weakest_claim(declared: str, circularity: str) -> str:
     return min(candidates, key=lambda label: CLAIM_STRENGTH.get(label, -1))
 
 
+def label_basis(declared: str, circularity: str) -> str:
+    """WHICH source decided the label, per arm. Deliberately not why that source decided it.
+
+    The label has two possible origins and they mean different things, so a single generalization
+    in the report prose is guaranteed to be wrong for some arm. MetaboliteAnnotator is labelled
+    coverage because its headline is a NAME-HIT RATE, while RefMet is labelled coverage because its
+    gold source is INGESTED into the graph. Telling every reader "coverage means the gold source was
+    ingested" is false for the first.
+
+    This names the deciding source and stops there. An earlier version tried to state the
+    underlying reason too and got it wrong in both directions: it reported "gold source is ingested"
+    for Hajjar, whose circularity verdict is ``accuracy_candidate`` precisely because NO gold source
+    of that arm is in the build, and "metric is coverage by construction" for MetaBench, which is
+    ``partly_circular`` on xref provenance rather than on being a coverage metric. The per-arm
+    reason already exists, verbatim and derived from the build, in the manifest's ``circularity``
+    register; duplicating it in prose only creates a second copy that can be wrong.
+    """
+    if not declared and not circularity:
+        return ""
+    if declared and circularity and declared != circularity:
+        return (
+            "per-run circularity verdict"
+            if weakest_claim(declared, circularity) == circularity
+            else "arm's declared role"
+        )
+    if circularity and not declared:
+        return "per-run circularity verdict"
+    if declared and not circularity:
+        return "arm's declared role"
+    return "both sources agree"
+
+
 def _headline(record: dict[str, Any]) -> dict[str, Any]:
     """The arm's quotable numbers, extracted for the aggregate manifest.
 
@@ -324,8 +356,8 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         "",
         "## Arms",
         "",
-        "| arm | status | label | declared role | note |",
-        "|---|---|---|---|---|",
+        "| arm | status | label | why this label | declared role | note |",
+        "|---|---|---|---|---|---|",
     ]
     for entry in manifest["datasets"]:
         circ = (manifest["circularity"].get(entry["dataset"], {}) or {}).get("label", "")
@@ -333,24 +365,36 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         flag = " **(disagrees)**" if circ and declared and circ != declared else ""
         note = entry.get("reason") or entry.get("error") or ""
         lines.append(
-            f"| {entry['dataset']} | {entry['status']} | {weakest_claim(declared, circ)} | "
-            f"{declared or 'n/a'}{flag} | {note} |"
+            f"| {entry['dataset']} | {entry['status']} | "
+            f"{weakest_claim(declared, circ) or 'n/a'} | "
+            f"{label_basis(declared, circ) or 'n/a'} | {declared or 'n/a'}{flag} | {note} |"
         )
     lines += [
         "",
         "## Reading these numbers",
         "",
         "- An arm labelled `coverage` measures whether an identifier was produced, not whether it",
-        "  was right. Its gold source is ingested into the graph being measured, so it must not be",
-        "  quoted as accuracy.",
+        "  was right, and must not be quoted as accuracy. There are TWO distinct reasons an arm",
+        "  earns that label:",
+        "    - its gold source is ingested into the graph being measured, so the gold and the",
+        "      answer share a source (RefMet, LMSD, the gene arms); or",
+        "    - the headline metric is a coverage measure by construction, such as a name-hit rate,",
+        "      regardless of where the gold came from (MetaboliteAnnotator).",
+        "  Do not assume the first reason: it is false for a coverage-by-construction arm. The",
+        "  `why this label` column names which SOURCE decided, and the manifest's `circularity`",
+        "  block carries that source's own per-arm reason verbatim. Read the reason there rather",
+        "  than inferring it from the label.",
         "- Gene arms report accuracy PER TARGET NAMESPACE. The any-namespace roll-up is emitted",
         "  flagged non-quotable.",
         "- A `skipped` arm has a reason. It is not a zero and not a pass.",
         "- A `partial` arm completed some sub-arms and not others. Its numbers cover only what",
         "  completed, so they are not the full benchmark.",
-        "- Where `label` and `declared role` disagree, trust `label`: it is derived per run from",
-        "  this build's own ingested-source list, while `declared role` is a static config field",
-        "  that defaults to `accuracy`.",
+        "- Where `label` and `declared role` disagree, `label` is the WEAKER of the two claims.",
+        "  Neither source can simply win: `declared role` is a static config field that defaults",
+        "  to `accuracy` and so overstates when unset, while the circularity verdict only asks",
+        "  whether the gold source was ingested and cannot see an arm that is coverage by",
+        "  construction. Overstating coverage as accuracy is the error that misleads a reader, so",
+        "  the weaker claim is taken and its origin is recorded per row.",
         "",
         "## Which structure number is 'strict'",
         "",
