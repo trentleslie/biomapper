@@ -66,6 +66,7 @@ from biomapper.benchmarks.scorers.arm_b_baseline import (
     MONTI_PUBLISHED,
     MONTI_PUBLISHED_PROVENANCE,
     MONTI_PUBLISHED_SUPERSEDED,
+    MONTI_S03_DERIVED,
     PAIR_METHOD,
     arm_b_overlap,
 )
@@ -681,6 +682,7 @@ def run_links(
             "monti_published": published,
             "monti_published_provenance": MONTI_PUBLISHED_PROVENANCE[cohort],
             "monti_published_superseded_value": MONTI_PUBLISHED_SUPERSEDED[cohort],
+            "monti_s03_derived": MONTI_S03_DERIVED.get(cohort),
             "arm_b_gap_to_published": derived.count - published,
             "arm_m_vs_arm_b": overlap.n_a_linked - derived.count,
             "arm_m_vs_published": overlap.n_a_linked - published,
@@ -990,11 +992,22 @@ def main(argv: list[str] | None = None) -> int:
             "monti_reference": {
                 "doi": "10.1007/s11357-026-02174-2",
                 "gold": "MOESM5 (Supplementary Table 5), 1495 metabolites",
+                # Must agree with arm_b_baseline.MONTI_PUBLISHED_PROVENANCE. A run record carrying
+                # two different accounts of where its comparator came from cannot be audited, and an
+                # earlier version of this note said the opposite of the per-cohort provenance.
                 "published_overlaps_read_from": (
-                    "Methods, 'Datasets harmonization' and the per-cohort descriptions. "
-                    "NOT Table 2, "
-                    "which is 'Age-only markers'."
+                    "supplement MOESM6, sheet 'Table 2. Datasets', '# Overlap' column, with "
+                    "NECS as the reference row. Corroborated by supplement Table S03 over its 1052 "
+                    "metabolite rows (see monti_s03_derived per pair)."
                 ),
+                "published_overlaps_NOT_read_from": (
+                    "the Methods 'Datasets harmonization' prose, which disagrees with the table on "
+                    "two pairs (Xu 385, BLSA 188) and is superseded by it. The MAIN TEXT's Table 2 "
+                    "is 'Age-only markers' and is a different table from the supplement's "
+                    "'Table 2. Datasets'; conflating the two is what made the prose look "
+                    "authoritative."
+                ),
+                "per_pair_provenance": "results.<cohort>.monti_published_provenance",
             },
         },
         "panel_sizes_loaded": {k: len(v.names) for k, v in panels.items()},

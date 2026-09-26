@@ -44,6 +44,35 @@ version bumps that landed in this repository but were never uploaded to the rele
 release first contained a module: the source tree and the PyPI index diverge across the 1.5.x
 series.
 
+## [1.5.3] - 2026-09-25
+
+### Fixed
+
+- **`MONTI_PUBLISHED` reverted to the tabulated values.** 1.5.0 changed the published comparator from
+  the paper's prose, moving Xu to 385 and BLSA to 188. Both moves were wrong. Two tabulated sources
+  agree with the original values and were not consulted at the time:
+
+  - Supplement **MOESM6, sheet "Table 2. Datasets"**, carries an explicit `# Overlap` column with NECS
+    as the reference row: LLFS 163, Arivale 615, **BLSA 99**, **Xu 432**.
+  - Supplement **Table S03** (signatures, 1052 metabolite rows), counting rows with any non-null
+    statistic per cohort, derives **Xu 432 exactly**, LLFS 162, and **BLSA 88**. 88 sits 11 from 99 and
+    100 from 188, which rules 188 out.
+
+  The prose sentence that produced 188 appears to have carried the paper's **LLFS lipid count**
+  ("408 metabolites (188 lipid and 220 polar)"). That coincidence is retained in
+  `MONTI_PUBLISHED_PROVENANCE` because it is the evidence, not a footnote.
+
+  A partial correction to an earlier claim as well: the MAIN TEXT's Table 2 is "Age-only markers" and
+  is not an overlap table, but the SUPPLEMENT's "Table 2. Datasets" is. The earlier statement was half
+  right.
+
+  `MONTI_PUBLISHED_SUPERSEDED` now holds the prose-derived values, `MONTI_S03_DERIVED` records the S03
+  counts, and every provenance entry cites the table rather than a quote.
+
+### Changed
+
+- Run manifests record `monti_s03_derived` per pair alongside the published overlap.
+
 ## [1.5.2] - 2026-09-24
 
 ### Fixed

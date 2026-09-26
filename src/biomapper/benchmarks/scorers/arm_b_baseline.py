@@ -4,12 +4,14 @@ Ported from the biomapper2 engine at ``origin/dev``
 (``studies/external_benchmarks/scorers/arm_b_baseline.py``, commit
 ``1ffb571e54fe028ef0ae4e748fc2e7ec093ee603``). The reconstruction logic is unchanged.
 
-**The published-overlap table IS changed, and that is the point of this docstring.** The engine
-constant read ``{"arivale": 615, "xuetal": 432, "llfs": 163, "blsa": 99}`` and attributed all four
-to "Monti Table 2". Re-read against the paper PDF (DOI 10.1007/s11357-026-02174-2), two of the four
-values are wrong and the citation points at the wrong table. Both the corrected and the superseded
-values are kept below so a number can never move without the reason being visible. See
-:data:`MONTI_PUBLISHED_PROVENANCE`.
+**The published-overlap table is sourced from the SUPPLEMENT'S TABLE, not the paper's prose, and
+that is the point of this docstring.** An earlier pass re-derived these from the Methods narrative
+and moved two of the four (Xu to 385, BLSA to 188). Both moves were wrong: supplement MOESM6's
+"Table 2. Datasets" carries an explicit ``# Overlap`` column, Table S03 corroborates it
+independently, and both agree with the original values. The prose loses to the table. The
+prose-derived values are retained in :data:`MONTI_PUBLISHED_SUPERSEDED` so the reversal stays
+traceable, and :data:`MONTI_PUBLISHED_PROVENANCE` records where each number comes from and what
+disagrees with it.
 
 Arm B is the number BioMapper is measured against. It is reconstructed here on the IDENTICAL row
 set the M/M+ID arms use, so the comparison is like-for-like (R21a). Two methods, per the paper's
@@ -34,79 +36,118 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Monti et al. 2026 published NECS<->cohort overlaps (the un-gamed comparator; we did not compute
-# these). Corrected 2026-09-23 by re-reading the paper. The values live in the Methods section
-# "Datasets harmonization" and in the per-cohort descriptions, NOT in Table 2 (Table 2 is "Age-only
-# markers"). Two entries in the engine's table were wrong:
+# these). These are the TABULATED values, which is the point: an earlier pass derived them from the
+# Methods prose and got two of the four wrong. The prose loses to the table.
 #
-#   xuetal: the engine had 432, taken from the Xu cohort description ("432 metabolites were matched
-#           to metabolites in the NECS dataset"). The Methods harmonization sentence says 385:
-#           "when comparing NECS with Arivale and with Xu et al., we used the Metabolon-provided
-#           CHEMICAL_NAME's, which yielded an overlap of 615 and 385 metabolites, respectively."
-#           The paper contradicts itself on this one pair. 385 is used here because it comes from
-#           the sentence describing the harmonization PROCEDURE this module reconstructs, and that
-#           same sentence's Arivale value (615) agrees with the Arivale cohort description. 432 is
-#           retained in MONTI_PUBLISHED_PROVENANCE so the conflict is reportable, never hidden.
+# Primary source: supplement MOESM6, sheet "Table 2. Datasets", which carries an explicit
+# ``# Overlap`` column with NECS as the reference row (NECS's own cell is blank because it is the
+# reference). Read directly:
 #
-#   blsa:   the engine had 99, which is NOT a NECS overlap. The BLSA cohort description says
-#           "Ninety-nine metabolites were in common with the LLFS using RefMet standardized names"
-#           - that is BLSA<->LLFS. Scoring a NECS<->BLSA reconstruction against it compares two
-#           different pairs. The NECS<->BLSA value is 188, from the same Methods sentence as LLFS:
-#           "When comparing NECS with LLFS and BLSA, we mapped all metabolites to RefMet
-#           identifiers, which yielded an overlap of 163 and 188 metabolites, respectively."
+#     Dataset (Platform)          # Subjects  # Metabolites  # Overlap
+#     NECS (Metabolon)                   213           1213          -
+#     LLFS (MS)                         2764            408        163
+#     Arivale (Metabolon)                634            626        615
+#     BLSA (Biocrates)                  1135            468         99
+#     Xu et al., '22 (Metabolon)         382            821        432
 #
-# Caveat worth carrying into any write-up: 188 is also the paper's count of LIPID metabolites in the
-# LLFS panel ("408 metabolites (188 lipid and 220 polar)"). The coincidence is not evidence of a
-# transcription error in the paper, and the harmonization sentence is explicit, so 188 is taken at
-# face value. Flag it rather than silently preferring one reading.
-MONTI_PUBLISHED: dict[str, int] = {"arivale": 615, "xuetal": 385, "llfs": 163, "blsa": 188}
+# Corroborated independently by supplement Table S03 (signatures), 1052 metabolite rows: counting
+# rows with any non-null statistic in each cohort's columns derives xuetal = 432 EXACTLY, llfs = 162
+# against a published 163, and blsa = 88. 88 is 11 short of 99 and 100 short of 188, so it places
+# BLSA at 99 and rules 188 out.
+#
+# What the earlier pass got wrong, recorded because the reasoning was superficially good:
+#
+#   xuetal: reached 385 from the Methods sentence "we used the Metabolon-provided CHEMICAL_NAME's,
+#           which yielded an overlap of 615 and 385 metabolites, respectively". Both the overlap
+#           table and the S03 derivation say 432, and the Xu cohort description says 432. The prose
+#           "385" is the lone outlier and is not the number to reconstruct against.
+#
+#   blsa:   reached 188 from "When comparing NECS with LLFS and BLSA, we mapped all metabolites to
+#           RefMet identifiers, which yielded an overlap of 163 and 188 metabolites, respectively".
+#           The table says 99. **188 is the paper's own count of LIPID metabolites in the LLFS
+#           panel** ("408 metabolites (188 lipid and 220 polar)"), which now explains where the
+#           prose number came from and why it was the wrong one to reach for: the sentence appears
+#           to have carried the LLFS lipid count. Keeping this note visible is the point, because
+#           the coincidence is the evidence.
+#
+# A note on the citation, since an earlier pass also overstated this: the MAIN TEXT's Table 2 is
+# indeed "Age-only markers" and is not an overlap table. The overlaps are in the SUPPLEMENT's
+# "Table 2. Datasets" (MOESM6). Both statements are true and the earlier one was only half right.
+MONTI_PUBLISHED: dict[str, int] = {"arivale": 615, "xuetal": 432, "llfs": 163, "blsa": 99}
 
-# Superseded engine values, kept so a changed number is always traceable to a reason.
+# Values a prose-derived pass briefly used, kept so the reversal stays traceable rather than looking
+# like the table had always been consulted.
 MONTI_PUBLISHED_SUPERSEDED: dict[str, int] = {
     "arivale": 615,
-    "xuetal": 432,
+    "xuetal": 385,
     "llfs": 163,
-    "blsa": 99,
+    "blsa": 188,
 }
 
-# Per-pair citation for every published value, so a manifest can carry the quote rather than a bare
-# integer. ``conflict`` is populated only where the paper itself disagrees with itself.
+# Per-cohort counts derived from supplement Table S03 over its 1052 metabolite rows, recorded
+# alongside the published overlaps as the independent corroboration. Not a substitute for the
+# published number: S03 counts metabolites carrying a statistic, which is a related but distinct
+# quantity, hence llfs 162 against a published 163 and blsa 88 against 99.
+MONTI_S03_DERIVED: dict[str, int] = {"xuetal": 432, "llfs": 162, "blsa": 88}
+
+# Per-pair citation for every published value, so a manifest can carry the source rather than a bare
+# integer. ``conflict`` records where the paper's PROSE disagrees with its own table.
 MONTI_PUBLISHED_PROVENANCE: dict[str, dict[str, object]] = {
     "arivale": {
         "published": 615,
-        "quote": "which yielded an overlap of 615 and 385 metabolites, respectively",
-        "section": "Methods, 'Datasets harmonization'",
-        "corroborated_by": "Arivale cohort description: 'After name curation, 615 metabolites were matched to metabolites in the NECS dataset'",
+        "source": "supplement MOESM6, sheet 'Table 2. Datasets', '# Overlap' column",
+        "s03_derived": None,
+        "corroborated_by": (
+            "Methods prose and the Arivale cohort description both also say 615: 'After name "
+            "curation, 615 metabolites were matched to metabolites in the NECS dataset'"
+        ),
         "conflict": None,
     },
     "xuetal": {
-        "published": 385,
-        "quote": "which yielded an overlap of 615 and 385 metabolites, respectively",
-        "section": "Methods, 'Datasets harmonization'",
-        "corroborated_by": None,
+        "published": 432,
+        "source": "supplement MOESM6, sheet 'Table 2. Datasets', '# Overlap' column",
+        "s03_derived": 432,
+        "corroborated_by": (
+            "Table S03 derives exactly 432, and the Xu cohort description says '432 metabolites "
+            "were matched to metabolites in the NECS dataset'"
+        ),
         "conflict": {
-            "alternate": 432,
-            "quote": "A total of 821 lipid and polar metabolites were generated using non-targeted metabolomic analysis, and 432 metabolites were matched to metabolites in the NECS dataset",
-            "section": "Xu et al. cohort description",
-            "note": "the paper states both 385 and 432 for NECS<->Xu; unresolved in the source",
+            "prose_value": 385,
+            "quote": "which yielded an overlap of 615 and 385 metabolites, respectively",
+            "section": "Methods, 'Datasets harmonization'",
+            "resolution": (
+                "the table, the S03 derivation and the cohort description all say 432; the prose "
+                "385 is the lone outlier and is not used"
+            ),
         },
     },
     "llfs": {
         "published": 163,
-        "quote": "which yielded an overlap of 163 and 188 metabolites, respectively",
-        "section": "Methods, 'Datasets harmonization'",
-        "corroborated_by": "LLFS cohort description: 'Of these, 163 metabolites were matched to the NECS metabolites based on RefMet standardized names'",
+        "source": "supplement MOESM6, sheet 'Table 2. Datasets', '# Overlap' column",
+        "s03_derived": 162,
+        "corroborated_by": (
+            "Methods prose and the LLFS cohort description both also say 163; Table S03 derives "
+            "162, one short, consistent with S03 counting metabolites that carry a statistic"
+        ),
         "conflict": None,
     },
     "blsa": {
-        "published": 188,
-        "quote": "which yielded an overlap of 163 and 188 metabolites, respectively",
-        "section": "Methods, 'Datasets harmonization'",
-        "corroborated_by": None,
+        "published": 99,
+        "source": "supplement MOESM6, sheet 'Table 2. Datasets', '# Overlap' column",
+        "s03_derived": 88,
+        "corroborated_by": (
+            "Table S03 derives 88, which is 11 from 99 and 100 from 188, placing BLSA at 99"
+        ),
         "conflict": {
-            "alternate": 99,
-            "quote": "Ninety-nine metabolites were in common with the LLFS using RefMet standardized names",
-            "section": "BLSA cohort description",
-            "note": "99 is the BLSA<->LLFS overlap, a different pair; it was the engine's value for NECS<->BLSA and is wrong for this comparison",
+            "prose_value": 188,
+            "quote": "which yielded an overlap of 163 and 188 metabolites, respectively",
+            "section": "Methods, 'Datasets harmonization'",
+            "resolution": (
+                "the table says 99 and S03 derives 88. 188 is the paper's own count of LIPID "
+                "metabolites in the LLFS panel ('408 metabolites (188 lipid and 220 polar)'), so "
+                "the prose sentence appears to have carried the LLFS lipid count. That coincidence "
+                "is the evidence and must stay visible."
+            ),
         },
     },
 }

@@ -48,6 +48,7 @@ from biomapper.benchmarks.scorers.arm_b_baseline import (
     MONTI_PUBLISHED,
     MONTI_PUBLISHED_PROVENANCE,
     MONTI_PUBLISHED_SUPERSEDED,
+    MONTI_S03_DERIVED,
     arm_b_overlap,
     name_match_overlap,
     refmet_join_overlap,
@@ -287,29 +288,59 @@ def test_gap_to_monti_published_is_recorded():
     assert result.published == 615 and result.gap == 1 - 615
 
 
-def test_monti_published_table_is_the_corrected_one():
-    # Re-read from Monti 2026 Methods, "Datasets harmonization". Xu is 385 there (the paper also
-    # says 432 in its Xu cohort description, which is an internal contradiction). BLSA is 188; the
-    # engine's 99 was the BLSA<->LLFS overlap, a different pair.
-    assert {"arivale": 615, "xuetal": 385, "llfs": 163, "blsa": 188} == MONTI_PUBLISHED
+def test_blsa_scores_against_99_not_188():
+    # The reverted comparator, asserted at the scoring boundary rather than only on the constant.
+    result = arm_b_overlap("blsa", ["a"], ["b"], refmet_map={"a": "X", "b": "X"})
+    assert result.published == 99
 
 
-def test_superseded_values_are_retained_for_traceability():
-    assert {"arivale": 615, "xuetal": 432, "llfs": 163, "blsa": 99} == MONTI_PUBLISHED_SUPERSEDED
+def test_xu_scores_against_432_not_385():
+    result = arm_b_overlap("xuetal", ["Glucose"], ["Glucose"])
+    assert result.published == 432
+
+
+def test_monti_published_comes_from_the_supplement_table():
+    # Supplement MOESM6, sheet "Table 2. Datasets", '# Overlap' column, NECS as reference. An
+    # earlier pass derived these from the Methods prose and moved Xu to 385 and BLSA to 188; the
+    # table and Table S03 both say otherwise, and the prose loses to the table.
+    assert {"arivale": 615, "xuetal": 432, "llfs": 163, "blsa": 99} == MONTI_PUBLISHED
+
+
+def test_the_prose_derived_values_are_retained_as_superseded():
+    # Kept so the reversal stays traceable rather than looking like the table was always consulted.
+    assert {"arivale": 615, "xuetal": 385, "llfs": 163, "blsa": 188} == MONTI_PUBLISHED_SUPERSEDED
     assert MONTI_PUBLISHED_SUPERSEDED["blsa"] != MONTI_PUBLISHED["blsa"]
     assert MONTI_PUBLISHED_SUPERSEDED["xuetal"] != MONTI_PUBLISHED["xuetal"]
 
 
-def test_every_published_value_carries_a_quote_and_section():
+def test_s03_derivation_is_recorded_as_independent_corroboration():
+    # 1052 metabolite rows, counting any non-null statistic per cohort. Xu lands exactly on the
+    # published 432. BLSA derives 88, which is 11 from 99 and 100 from 188, so it rules 188 out.
+    assert {"xuetal": 432, "llfs": 162, "blsa": 88} == MONTI_S03_DERIVED
+    assert MONTI_S03_DERIVED["xuetal"] == MONTI_PUBLISHED["xuetal"]
+    assert abs(MONTI_S03_DERIVED["blsa"] - MONTI_PUBLISHED["blsa"]) < abs(
+        MONTI_S03_DERIVED["blsa"] - MONTI_PUBLISHED_SUPERSEDED["blsa"]
+    )
+
+
+def test_the_188_lipid_count_coincidence_stays_visible():
+    # 188 is the paper's own count of LIPID metabolites in the LLFS panel. That explains where the
+    # prose number came from and why it was the wrong one to reach for, so it must not be dropped.
+    resolution = MONTI_PUBLISHED_PROVENANCE["blsa"]["conflict"]["resolution"]
+    assert "LIPID" in resolution
+    assert "188 lipid and 220 polar" in resolution
+
+
+def test_every_published_value_names_its_source():
     for cohort, published in MONTI_PUBLISHED.items():
         record = MONTI_PUBLISHED_PROVENANCE[cohort]
         assert record["published"] == published
-        assert record["quote"] and record["section"]
-    # Only the two pairs the paper disagrees with itself about carry a conflict record.
+        assert "MOESM6" in str(record["source"])
+    # A conflict record exists only where the paper's PROSE disagrees with its own table.
     assert MONTI_PUBLISHED_PROVENANCE["arivale"]["conflict"] is None
     assert MONTI_PUBLISHED_PROVENANCE["llfs"]["conflict"] is None
-    assert MONTI_PUBLISHED_PROVENANCE["xuetal"]["conflict"]["alternate"] == 432
-    assert MONTI_PUBLISHED_PROVENANCE["blsa"]["conflict"]["alternate"] == 99
+    assert MONTI_PUBLISHED_PROVENANCE["xuetal"]["conflict"]["prose_value"] == 385
+    assert MONTI_PUBLISHED_PROVENANCE["blsa"]["conflict"]["prose_value"] == 188
 
 
 # ==================================================================================================
@@ -749,9 +780,10 @@ def test_run_links_without_an_error_map_counts_every_empty_row_as_unresolved(tmp
 def test_run_links_carries_the_published_provenance_and_the_superseded_value(tmp_path):
     panels, curies = _link_fixture()
     results = run_links(panels, curies, {"glucose": "Glucose"}, tmp_path)
-    assert results["blsa"]["monti_published"] == 188
-    assert results["blsa"]["monti_published_superseded_value"] == 99
-    assert results["blsa"]["monti_published_provenance"]["conflict"]["alternate"] == 99
+    assert results["blsa"]["monti_published"] == 99
+    assert results["blsa"]["monti_published_superseded_value"] == 188
+    assert results["blsa"]["monti_s03_derived"] == 88
+    assert results["blsa"]["monti_published_provenance"]["conflict"]["prose_value"] == 188
     # Names-only cohorts say so in the result, so a table cannot render a blank as a failure.
     assert results["blsa"]["certifiable"] is False
     assert "never structurally certifiable" in results["blsa"]["certifiability_note"]
@@ -986,3 +1018,22 @@ def test_repair_still_runs_for_a_confirmed_checkpoint(tmp_path):
     )
     assert pin["status"] == "match"
     assert repair.get("skipped") is None and repair["recovered"] == 1
+
+
+def test_the_manifest_source_note_agrees_with_the_per_pair_provenance():
+    """A run record must not carry two different accounts of where its comparator came from.
+
+    The manifest-level note once said the overlaps came from the Methods prose and "NOT Table 2",
+    while the per-cohort provenance cited the supplement's "Table 2. Datasets". Both appeared in the
+    same record, which makes the corrected Xu and BLSA values unauditable.
+    """
+    import inspect
+
+    import biomapper.benchmarks.cross_cohort as module
+
+    source = inspect.getsource(module.main)
+    assert "supplement MOESM6, sheet 'Table 2. Datasets'" in source
+    # The prose is named as what the values are NOT read from, and the two Table 2s are kept apart.
+    assert "published_overlaps_NOT_read_from" in source
+    for cohort in ("arivale", "xuetal", "llfs", "blsa"):
+        assert "MOESM6" in str(MONTI_PUBLISHED_PROVENANCE[cohort]["source"])
