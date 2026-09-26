@@ -22,6 +22,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from biomapper.benchmarks.scorers.structure_oracle_scorer import (
+    STRICT_KG_ONLY_DEFINITION,
+)
+
 CAMPAIGN_FRAMING = (
     "Deferred follow-on to the Hajjar vertical slice. Metabolite arm (NECS) is scored by the "
     "independent InChIKey structure oracle (strict + charge-normalized); the gene/protein arm "
@@ -29,6 +33,53 @@ CAMPAIGN_FRAMING = (
     "backbone's authoritative held-out cross-references. ONE accuracy number per dataset (no "
     "per-vocab axis). No competitor comparison exists for these sets, so none is drawn."
 )
+
+
+#: Printed in a "Top-1 (strict)" cell when the artifact cannot supply the published strict figure.
+#: Deliberately not a number and not blank: the name-fallback value is the wrong answer here, and a
+#: blank cell reads as zero to a skimming reader.
+STRICT_UNAVAILABLE = "n/a (strict not in artifact)"
+
+
+def _strict_core(result: dict[str, Any]) -> dict[str, Any] | None:
+    """The figure that belongs under a column headed "strict", or ``None`` if there isn't one.
+
+    ``comparable_core`` is the name-fallback variant, so substituting it here is the very error
+    this function exists to prevent: on Hajjar-100 it is 95/100 where the published strict figure
+    is 92/100, and a reader of the column has no way to tell which they were handed.
+
+    Three cases, in order:
+
+    1. ``comparable_core_strict_kg_only`` is present. Use it.
+    2. It is absent, but ``per_row`` is present. RECOMPUTE it: a row is strict-correct when it was
+       correct and did not need the name fallback, which is exactly how the figure was derived by
+       hand from older artifacts. The denominator is unchanged, so the recomputed value is
+       comparable with the stored variants.
+    3. Neither is available. Return ``None``, and the caller prints an explicit gap. An empty cell
+       is recoverable; a wrong number under a "strict" heading is not.
+    """
+    strict = result.get("comparable_core_strict_kg_only")
+    if isinstance(strict, dict):
+        return strict
+
+    per_row = result.get("per_row")
+    core = result.get("comparable_core")
+    if not isinstance(per_row, list) or not isinstance(core, dict):
+        return None
+
+    scored = [row for row in per_row if row.get("scored")]
+    if not scored:
+        return None
+    correct = sum(1 for row in scored if row.get("correct") and not row.get("needed_fallback"))
+    return {
+        "metric": "top1_accuracy_strict_kg_only",
+        "top1_accuracy": correct / len(scored),
+        "correct": correct,
+        "scored_denominator": len(scored),
+        "definition": STRICT_KG_ONLY_DEFINITION,
+        "is_published_strict": True,
+        "recomputed_from_per_row": True,
+    }
 
 
 def _pct(x: float | None) -> str:
@@ -75,26 +126,30 @@ def _name_source_regime_rows(entry: dict[str, Any]) -> list[str]:
     rows: list[str] = []
     for k in keys:
         r = by[k]
-        core = r["comparable_core"]
+        core = _strict_core(r)
         cn = r.get("comparable_core_charge_normalized")
         cn_acc = _pct(cn["top1_accuracy"]) if cn else "n/a"
         cov = r.get("coverage", {})
+        strict_acc = _pct(core["top1_accuracy"]) if core else STRICT_UNAVAILABLE
+        scored_n = core["scored_denominator"] if core else "n/a"
         rows.append(
-            f"| {entry['key']} | {REGIME_LABELS.get(k, k)} | {_pct(core['top1_accuracy'])} | {cn_acc} | "
-            f"{core['scored_denominator']} | {cov.get('n_predicted', '?')}/{cov.get('total', '?')} |"
+            f"| {entry['key']} | {REGIME_LABELS.get(k, k)} | {strict_acc} | {cn_acc} | "
+            f"{scored_n} | {cov.get('n_predicted', '?')}/{cov.get('total', '?')} |"
         )
     return rows
 
 
 def _metabolite_row(entry: dict[str, Any]) -> str:
-    core = entry["result"]["comparable_core"]
+    core = _strict_core(entry["result"])
     cn = entry["result"].get("comparable_core_charge_normalized")
     cn_acc = _pct(cn["top1_accuracy"]) if cn else "n/a"
     cov = entry["result"]["coverage"]
     fb = entry["result"].get("fallback_bucket", {})
+    strict_acc = _pct(core["top1_accuracy"]) if core else STRICT_UNAVAILABLE
+    scored_n = core["scored_denominator"] if core else "n/a"
     return (
-        f"| {entry['key']} | metabolite | {_pct(core['top1_accuracy'])} | {cn_acc} | "
-        f"{core['scored_denominator']} | {cov['n_predicted']}/{cov['total']} | {fb.get('count', 0)} |"
+        f"| {entry['key']} | metabolite | {strict_acc} | {cn_acc} | "
+        f"{scored_n} | {cov['n_predicted']}/{cov['total']} | {fb.get('count', 0)} |"
     )
 
 
@@ -183,7 +238,9 @@ def assemble_campaign_report(
     if curie_entries:
         lines.append("## Gene/protein arm — CURIE-equality accuracy (one number per dataset)")
         lines.append("")
-        lines.append("| Dataset | Arm | Top-1 accuracy | Scored n | Coverage | Precision | Recall | F1 |")
+        lines.append(
+            "| Dataset | Arm | Top-1 accuracy | Scored n | Coverage | Precision | Recall | F1 |"
+        )
         lines.append("|---|---|---|---|---|---|---|---|")
         for entry in curie_entries:
             lines.append(_curie_row(entry))
@@ -212,8 +269,12 @@ def assemble_campaign_report(
 
     lines.append("## Notes")
     lines.append("")
-    lines.append("- No published same-set competitor exists for NECS or the backbones — no competitor figure is drawn.")
-    lines.append("- Per-vocab breakdown is intentionally omitted (annotation-driven, not vocab-steered).")
+    lines.append(
+        "- No published same-set competitor exists for NECS or the backbones — no competitor figure is drawn."
+    )
+    lines.append(
+        "- Per-vocab breakdown is intentionally omitted (annotation-driven, not vocab-steered)."
+    )
     lines.append(f"- Reconciliation passed: {integrity.get('reconciliation_passed')}")
     lines.append(f"- Validation passed: {integrity.get('validation_passed')}")
     lines.append("")

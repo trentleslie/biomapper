@@ -226,6 +226,73 @@ def run_suite(
     return {"out_dir": str(suite_dir), "manifest": manifest, "results": results}
 
 
+# How strong a claim each label makes, weakest first. Used to reconcile the two label sources.
+CLAIM_STRENGTH: dict[str, int] = {
+    "coverage": 0,
+    "capability_regression": 0,
+    "partly_circular": 1,
+    "accuracy_candidate": 2,
+    "accuracy": 3,
+}
+
+
+def weakest_claim(declared: str, circularity: str) -> str:
+    """Reconcile the arm's declared role with the per-run circularity verdict, conservatively.
+
+    Two sources disagree for opposite reasons and neither can simply win.
+
+    ``role`` is a static config field that DEFAULTS to ``"accuracy"``, so it overstates whenever an
+    arm's author did not set it: that is how the README called RefMet accuracy while the same run's
+    circularity register called it coverage.
+
+    But ``circularity`` only asks whether the arm's gold source is ingested into the graph. It
+    cannot see an arm that is coverage *by construction* regardless of provenance, such as
+    MetaboliteAnnotator, whose headline is a name-hit rate that measures whether an identifier was
+    produced rather than whether it was right. For that arm circularity reports
+    ``accuracy_candidate`` while the runner correctly declares ``coverage``.
+
+    So take the WEAKER claim. Overstating a coverage number as accuracy is the error that actually
+    misleads a reader; understating an accuracy number is merely conservative. Unknown labels sort
+    as the weakest, because an unrecognized label is not evidence for a strong claim.
+    """
+    candidates = [label for label in (declared, circularity) if label]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda label: CLAIM_STRENGTH.get(label, -1))
+
+
+def label_basis(declared: str, circularity: str) -> str:
+    """WHICH source decided the label, per arm. Deliberately not why that source decided it.
+
+    The label has two possible origins and they mean different things, so a single generalization
+    in the report prose is guaranteed to be wrong for some arm. MetaboliteAnnotator is labelled
+    coverage because its headline is a NAME-HIT RATE, while RefMet is labelled coverage because its
+    gold source is INGESTED into the graph. Telling every reader "coverage means the gold source was
+    ingested" is false for the first.
+
+    This names the deciding source and stops there. An earlier version tried to state the
+    underlying reason too and got it wrong in both directions: it reported "gold source is ingested"
+    for Hajjar, whose circularity verdict is ``accuracy_candidate`` precisely because NO gold source
+    of that arm is in the build, and "metric is coverage by construction" for MetaBench, which is
+    ``partly_circular`` on xref provenance rather than on being a coverage metric. The per-arm
+    reason already exists, verbatim and derived from the build, in the manifest's ``circularity``
+    register; duplicating it in prose only creates a second copy that can be wrong.
+    """
+    if not declared and not circularity:
+        return ""
+    if declared and circularity and declared != circularity:
+        return (
+            "per-run circularity verdict"
+            if weakest_claim(declared, circularity) == circularity
+            else "arm's declared role"
+        )
+    if circularity and not declared:
+        return "per-run circularity verdict"
+    if declared and not circularity:
+        return "arm's declared role"
+    return "both sources agree"
+
+
 def _headline(record: dict[str, Any]) -> dict[str, Any]:
     """The arm's quotable numbers, extracted for the aggregate manifest.
 
@@ -235,6 +302,12 @@ def _headline(record: dict[str, Any]) -> dict[str, Any]:
     """
     result = record.get("results") or {}
     out: dict[str, Any] = {"role": record.get("role")}
+    # The published strict figure comes FIRST and is carried unconditionally. Omitting it here
+    # while the adjacent README advertises it would leave a reader of the aggregate manifest
+    # unable to retrieve the one number the report tells them to quote.
+    strict = result.get("comparable_core_strict_kg_only")
+    if isinstance(strict, dict):
+        out["comparable_core_strict_kg_only"] = strict
     core = result.get("comparable_core")
     if isinstance(core, dict):
         out["comparable_core"] = core
@@ -283,27 +356,63 @@ def _suite_readme(manifest: dict[str, Any]) -> str:
         "",
         "## Arms",
         "",
-        "| arm | status | role | note |",
-        "|---|---|---|---|",
+        "| arm | status | label | why this label | declared role | note |",
+        "|---|---|---|---|---|---|",
     ]
     for entry in manifest["datasets"]:
-        role = entry.get("role") or (manifest["circularity"].get(entry["dataset"], {}) or {}).get(
-            "label", ""
-        )
+        circ = (manifest["circularity"].get(entry["dataset"], {}) or {}).get("label", "")
+        declared = entry.get("role") or ""
+        flag = " **(disagrees)**" if circ and declared and circ != declared else ""
         note = entry.get("reason") or entry.get("error") or ""
-        lines.append(f"| {entry['dataset']} | {entry['status']} | {role} | {note} |")
+        lines.append(
+            f"| {entry['dataset']} | {entry['status']} | "
+            f"{weakest_claim(declared, circ) or 'n/a'} | "
+            f"{label_basis(declared, circ) or 'n/a'} | {declared or 'n/a'}{flag} | {note} |"
+        )
     lines += [
         "",
         "## Reading these numbers",
         "",
         "- An arm labelled `coverage` measures whether an identifier was produced, not whether it",
-        "  was right. Its gold source is ingested into the graph being measured, so it must not be",
-        "  quoted as accuracy.",
+        "  was right, and must not be quoted as accuracy. There are TWO distinct reasons an arm",
+        "  earns that label:",
+        "    - its gold source is ingested into the graph being measured, so the gold and the",
+        "      answer share a source (RefMet, LMSD, the gene arms); or",
+        "    - the headline metric is a coverage measure by construction, such as a name-hit rate,",
+        "      regardless of where the gold came from (MetaboliteAnnotator).",
+        "  Do not assume the first reason: it is false for a coverage-by-construction arm. The",
+        "  `why this label` column names which SOURCE decided, and the manifest's `circularity`",
+        "  block carries that source's own per-arm reason verbatim. Read the reason there rather",
+        "  than inferring it from the label.",
         "- Gene arms report accuracy PER TARGET NAMESPACE. The any-namespace roll-up is emitted",
         "  flagged non-quotable.",
         "- A `skipped` arm has a reason. It is not a zero and not a pass.",
         "- A `partial` arm completed some sub-arms and not others. Its numbers cover only what",
         "  completed, so they are not the full benchmark.",
+        "- Where `label` and `declared role` disagree, `label` is the WEAKER of the two claims.",
+        "  Neither source can simply win: `declared role` is a static config field that defaults",
+        "  to `accuracy` and so overstates when unset, while the circularity verdict only asks",
+        "  whether the gold source was ingested and cannot see an arm that is coverage by",
+        "  construction. Overstating coverage as accuracy is the error that misleads a reader, so",
+        "  the weaker claim is taken and its origin is recorded per row.",
+        "",
+        "## Which structure number is 'strict'",
+        "",
+        "Structure-oracle arms report three figures on the same scored rows. They are NOT",
+        "interchangeable, and one of them is the published one:",
+        "",
+        "- `comparable_core_strict_kg_only` is **the published strict figure**. The chosen node's",
+        "  own InChIKey matched. A row whose structure came from the external name lookup is a",
+        "  miss, because the graph did not supply it.",
+        "- `comparable_core` is the same measurement with a Metabolomics Workbench or PubChem",
+        "  lookup on the node's NAME allowed to fill in a structure-less node. Report it as the",
+        "  name-fallback variant in a methods note. It is **not** 'strict', though it was the",
+        "  headline historically, which is how one word came to mean two numbers.",
+        "- `comparable_core_kg_equivalence_set` counts a match against ANY connectivity the node",
+        "  asserts, so it is partly a measure of the graph's curation.",
+        "",
+        "Each carries `definition` and `is_published_strict` so the distinction survives being",
+        "read out of the JSON by someone who was not in the decision.",
         "",
         f"Generated {dt.datetime.now(dt.UTC).isoformat()}.",
     ]

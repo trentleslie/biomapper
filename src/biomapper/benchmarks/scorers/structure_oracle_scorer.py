@@ -23,6 +23,29 @@ from biomapper.benchmarks.config import DatasetConfig
 
 CHOSEN_COL = "chosen_kg_id"
 
+# The wording each reported variant carries, defined once. The blended figures and the per-regime
+# breakout both emit these; duplicating the strings is how two copies of "what this measures" end
+# up disagreeing, which is the exact failure this metadata exists to prevent.
+STRICT_KG_ONLY_DEFINITION = (
+    "the chosen KG node's own InChIKey matched the held-out gold. A row whose structure came from "
+    "the Metabolomics Workbench or PubChem name fallback is a MISS here, because the graph did not "
+    "supply the structure."
+)
+NAME_FALLBACK_DEFINITION = (
+    "structure taken from the chosen node's InChIKey when present, otherwise from a Metabolomics "
+    "Workbench or PubChem lookup on the node's NAME. Report this as the name-fallback variant in a "
+    "methods note, never as 'strict'."
+)
+CHARGE_NORMALIZED_DEFINITION = (
+    "both sides neutralized for charge and protonation before comparing connectivity. Reported "
+    "beside the strict figure, never in place of it."
+)
+KG_EQUIVALENCE_SET_DEFINITION = (
+    "gold matches ANY InChIKey first-block the chosen node asserts, not only the first. Partly a "
+    "measure of the graph's curation rather than of resolution alone, because a node asserting "
+    "several connectivities satisfies this more easily."
+)
+
 # ------------------------------------------------------------------------------------------------
 # Name-source regimes (LMSD lipid arm — two-regime split).
 #
@@ -46,7 +69,11 @@ def name_source_regime(source: Any) -> str:
     class; the common and systematic names fold into one "common/systematic" regime. Any unexpected
     or blank tag lands in common/systematic (never silently dropped from the breakout).
     """
-    return SHORTHAND_REGIME if str(source).strip().lower() == "abbreviation" else COMMON_SYSTEMATIC_REGIME
+    return (
+        SHORTHAND_REGIME
+        if str(source).strip().lower() == "abbreviation"
+        else COMMON_SYSTEMATIC_REGIME
+    )
 
 
 class StructureOracle(Protocol):
@@ -147,6 +174,12 @@ def score_structure_oracle(
     n_predicted = 0
     scored = 0  # accuracy denominator: rows with gold structure
     correct = 0
+    # The KG-record-only variant: a row counts only when the chosen node's OWN InChIKey matched.
+    # A row whose structure had to come from the external name fallback is a miss here, because
+    # under this definition the graph did not supply the structure. This is the published "strict"
+    # figure (decided 2026-09-23); ``comparable_core`` is the same measurement WITH the fallback
+    # allowed, and the two must never be conflated (Hajjar: 92 against 95).
+    strict_kg_only_correct = 0
     fallback_rows: list[str] = []
     # Charge-normalized tallies (only meaningful when cn_available).
     cn_scored = 0
@@ -177,11 +210,15 @@ def score_structure_oracle(
                 fallback_rows.append(chosen_id)
 
         is_scored = gold_block is not None
-        is_correct = bool(is_scored and predicted_block is not None and predicted_block == gold_block)
+        is_correct = bool(
+            is_scored and predicted_block is not None and predicted_block == gold_block
+        )
         if is_scored:
             scored += 1
             if is_correct:
                 correct += 1
+                if not needed_fallback:
+                    strict_kg_only_correct += 1
 
         # KG-equivalence-set membership (same scored population as strict). A hit means gold's
         # first-block is one of the chosen node's KG-asserted InChIKey blocks — recovers the
@@ -210,7 +247,13 @@ def score_structure_oracle(
             # source ships no SMILES to neutralize (can't neutralize a hash). Because gold_block
             # is not None here, gold_cn_block is always defined.
             gold_cn_block = gold_cn if gold_cn is not None else gold_block
-            pred_cn_block = oracle.neutral_block(chosen_id) if (has_pred and chosen_id is not None) else None  # type: ignore[attr-defined]
+            # ``neutral_block`` is an optional oracle capability, probed by ``hasattr`` above and
+            # gated by ``cn_available``, so it is absent from the Protocol on purpose.
+            pred_cn_block = (
+                oracle.neutral_block(chosen_id)  # type: ignore[attr-defined]
+                if (has_pred and chosen_id is not None)
+                else None
+            )
             cn_scored += 1
             cn_correct_row = bool(pred_cn_block is not None and pred_cn_block == gold_cn_block)
             if cn_correct_row:
@@ -224,7 +267,15 @@ def score_structure_oracle(
             row_source = str(row.get(name_source_column)).strip()
             t = regime_tally.setdefault(
                 name_source_regime(row_source),
-                {"n_rows": 0, "n_predicted": 0, "scored": 0, "correct": 0, "cn_scored": 0, "cn_correct": 0},
+                {
+                    "n_rows": 0,
+                    "n_predicted": 0,
+                    "scored": 0,
+                    "correct": 0,
+                    "strict": 0,
+                    "cn_scored": 0,
+                    "cn_correct": 0,
+                },
             )
             t["n_rows"] += 1
             if has_pred:
@@ -233,6 +284,8 @@ def score_structure_oracle(
                 t["scored"] += 1
                 if is_correct:
                     t["correct"] += 1
+                    if not needed_fallback:
+                        t["strict"] += 1
             if cn_correct_row is not None:  # row is in the charge-normalized scored set
                 t["cn_scored"] += 1
                 if cn_correct_row:
@@ -260,6 +313,8 @@ def score_structure_oracle(
             "top1_accuracy": (cn_correct / cn_scored) if cn_scored else None,
             "correct": cn_correct,
             "scored_denominator": cn_scored,
+            "definition": CHARGE_NORMALIZED_DEFINITION,
+            "is_published_strict": False,
         }
     else:
         cn_core = None
@@ -270,6 +325,8 @@ def score_structure_oracle(
             "top1_accuracy": (eq_correct / eq_scored) if eq_scored else None,
             "correct": eq_correct,
             "scored_denominator": eq_scored,
+            "definition": KG_EQUIVALENCE_SET_DEFINITION,
+            "is_published_strict": False,
         }
     else:
         eq_core = None
@@ -288,13 +345,25 @@ def score_structure_oracle(
                     "top1_accuracy": (t["cn_correct"] / t["cn_scored"]) if t["cn_scored"] else None,
                     "correct": t["cn_correct"],
                     "scored_denominator": t["cn_scored"],
+                    "definition": CHARGE_NORMALIZED_DEFINITION,
+                    "is_published_strict": False,
                 }
             by_regime[regime] = {
+                "comparable_core_strict_kg_only": {
+                    "metric": "top1_accuracy_strict_kg_only",
+                    "top1_accuracy": (t["strict"] / t["scored"]) if t["scored"] else None,
+                    "correct": t["strict"],
+                    "scored_denominator": t["scored"],
+                    "definition": STRICT_KG_ONLY_DEFINITION,
+                    "is_published_strict": True,
+                },
                 "comparable_core": {
-                    "metric": "top1_accuracy",
+                    "metric": "top1_accuracy_with_name_fallback",
                     "top1_accuracy": (t["correct"] / t["scored"]) if t["scored"] else None,
                     "correct": t["correct"],
                     "scored_denominator": t["scored"],
+                    "definition": NAME_FALLBACK_DEFINITION,
+                    "is_published_strict": False,
                 },
                 "comparable_core_charge_normalized": regime_cn,
                 "n_rows": t["n_rows"],
@@ -308,11 +377,26 @@ def score_structure_oracle(
     return {
         "vocab": vocab,
         "input_type": config.input_type,
+        # THE PUBLISHED STRICT FIGURE. KG-record InChIKey only, no external name lookup permitted
+        # to supply a structure. Reported first because a reader reaching for "the strict number"
+        # must land on this one and not on ``comparable_core``.
+        "comparable_core_strict_kg_only": {
+            "metric": "top1_accuracy_strict_kg_only",
+            "top1_accuracy": (strict_kg_only_correct / scored) if scored else None,
+            "correct": strict_kg_only_correct,
+            "scored_denominator": scored,
+            "definition": STRICT_KG_ONLY_DEFINITION,
+            "is_published_strict": True,
+        },
+        # The SAME measurement with the external name fallback allowed. Historically the headline,
+        # which is how "strict" came to mean two different numbers between documents.
         "comparable_core": {
-            "metric": "top1_accuracy",
+            "metric": "top1_accuracy_with_name_fallback",
             "top1_accuracy": accuracy,
             "correct": correct,
             "scored_denominator": scored,
+            "definition": NAME_FALLBACK_DEFINITION,
+            "is_published_strict": False,
         },
         "comparable_core_charge_normalized": cn_core,
         "comparable_core_kg_equivalence_set": eq_core,
