@@ -78,3 +78,7 @@ never run".
   list), plus the `captured` / `not_found` split above.
 - One kill-and-resume of the server mid-run: the job should come back `paused`, resume on its
   own, and leave no `store.lock`. A hard kill (SIGKILL) will leave the lock; the next job names it.
+
+## See also
+
+- `docs/solutions/best-practices/public-facade-over-mcp-job-runner-2026-11-13.md`: the same runner opened as public API in 1.9.0 (`biomapper.jobs.HarmonizeJobs`), with `on_progress` beside `on_message`.
