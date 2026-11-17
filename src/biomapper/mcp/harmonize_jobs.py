@@ -39,7 +39,7 @@ import shutil
 import stat
 import threading
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -94,6 +94,7 @@ from biomapper.mcp.jobs import (
     probe_pins,
 )
 from biomapper.models import MappingResult
+from biomapper.resolution import CohortResolutionPolicy, EngineSearchOptions
 
 if TYPE_CHECKING:
     from biomapper.mcp.jobs import JobManager
@@ -135,6 +136,23 @@ class CohortSpec(BaseModel):
         description="Identifier columns per vocabulary, e.g. {\"HMDB\": [\"hmdb_id\"]}. Note "
         "the direction: vocabulary to column(s), the reverse of map_file's identifier_columns.",
     )
+    extra_name_columns: list[str] = Field(
+        default_factory=list,
+        description="Additional unedited name columns to pass to a cohort resolution policy.",
+    )
+    search_options: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-cohort BioMapper engine search options (e.g. prefer_human, "
+        "prefer_canonical, candidate_limit, annotators).",
+    )
+    resolution_policy: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional multi-tier engine-only CohortResolutionPolicy configuration.",
+    )
+    strip_names: bool = Field(
+        default=True,
+        description="Set false to preserve raw cell strings verbatim without stripping.",
+    )
 
 
 class _Cancelled(Exception):
@@ -172,14 +190,57 @@ class GatedJobMapper(BatchedApiMapper):
         self._caches = caches
 
     def __call__(
-        self, records: list[dict[str, Any]], *, entity_type: str, annotation_mode: str
+        self,
+        records: list[dict[str, Any]],
+        *,
+        entity_type: str,
+        annotation_mode: str,
+        annotators: Sequence[str] | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
+        vocab: str | Sequence[str] | None = None,
+        array_delimiters: Sequence[str] | None = None,
     ) -> list[MappingResult]:
+        search_options: dict[str, Any] = {}
+        eff_annotators = list(annotators) if annotators is not None else self.annotators
+        eff_prefer_human = prefer_human if prefer_human is not None else self.prefer_human
+        eff_prefer_canonical = (
+            prefer_canonical if prefer_canonical is not None else self.prefer_canonical
+        )
+        eff_candidate_limit = (
+            candidate_limit if candidate_limit is not None else self.candidate_limit
+        )
+        eff_kestrel_top_n = (
+            kestrel_top_n if kestrel_top_n is not None else self.kestrel_top_n
+        )
+        eff_vocab = (
+            (vocab if isinstance(vocab, str) else list(vocab))
+            if vocab is not None
+            else self.vocab
+        )
+        eff_delims = (
+            list(array_delimiters) if array_delimiters is not None else self.array_delimiters
+        )
+        for key, value in (
+            ("annotators", eff_annotators),
+            ("prefer_human", eff_prefer_human),
+            ("prefer_canonical", eff_prefer_canonical),
+            ("candidate_limit", eff_candidate_limit),
+            ("kestrel_top_n", eff_kestrel_top_n),
+            ("vocab", eff_vocab),
+            ("array_delimiters", eff_delims),
+        ):
+            if value is not None:
+                search_options[key] = value
+
         out: list[MappingResult] = []
         for start in range(0, len(records), self.batch_size):
             chunk = records[start : start + self.batch_size]
             out.extend(anyio.from_thread.run(
                 self._runner.map_chunk, self._job, self._caches, chunk, entity_type,
-                annotation_mode,
+                annotation_mode, search_options or None,
             ))
         return out
 
@@ -330,9 +391,30 @@ class HarmonizeRunner:
             names: set[str] = set()
             cohorts: list[dict[str, Any]] = []
             for item, source in zip(specs, sources, strict=True):
+                policy = (
+                    CohortResolutionPolicy.from_value(item.resolution_policy)
+                    if item.resolution_policy is not None
+                    else None
+                )
+                search_opt = (
+                    EngineSearchOptions.from_value(item.search_options)
+                    if item.search_options is not None
+                    else None
+                )
+                merged_extras = list(dict.fromkeys([
+                    *item.extra_name_columns,
+                    *(policy.name_columns if policy is not None else ()),
+                ]))
+                effective_strip = (
+                    policy.strip_names
+                    if policy is not None and "strip_names" not in item.model_fields_set
+                    else item.strip_names
+                )
                 cohort = read_cohort(
                     source, label=item.label, name_column=item.name_column,
                     vocabularies=item.vocabularies or None, key_column=item.key_column,
+                    extra_name_columns=merged_extras or None,
+                    strip_names=effective_strip,
                 )
                 rows = int(cohort.source.get("n_rows", len(cohort.records)))
                 if rows > cap:
@@ -345,12 +427,23 @@ class HarmonizeRunner:
                         f"{source.name} has no rows with a value in {item.name_column!r}."
                     )
                 names.update(r.name for r in cohort.records)
-                cohorts.append({
+                for r in cohort.records:
+                    names.update(r.extra_names.values())
+                entry: dict[str, Any] = {
                     "label": item.label, "path": str(source), "sha256": _sha256(source),
                     "rows": len(cohort.records), "name_column": item.name_column,
                     "key_column": item.key_column,
                     "vocabularies": {v: list(c) for v, c in sorted(item.vocabularies.items())},
-                })
+                }
+                if merged_extras:
+                    entry["extra_name_columns"] = merged_extras
+                if search_opt is not None:
+                    entry["search_options"] = search_opt.to_dict()
+                if policy is not None:
+                    entry["resolution_policy"] = policy.to_dict()
+                if not effective_strip:
+                    entry["strip_names"] = False
+                cohorts.append(entry)
         except (ValueError, TypeError) as exc:
             raise JobError(str(exc)) from None
         return cohorts, len(names)
@@ -406,8 +499,10 @@ class HarmonizeRunner:
         options = {"remap_all": bool(remap_all)} if kind == "harmonize_many" else {}
         identity = {
             "kind": kind, "entity": entity, "category": category, "options": options,
-            "cohorts": [{k: c[k] for k in ("label", "sha256", "name_column", "key_column",
-                                           "vocabularies")} for c in cohorts],
+            "cohorts": [{k: c[k] for k in (
+                "label", "sha256", "name_column", "key_column", "vocabularies",
+                "extra_name_columns", "search_options", "resolution_policy", "strip_names",
+            ) if k in c} for c in cohorts],
         }
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         base = sources[0].parent
@@ -492,6 +587,7 @@ class HarmonizeRunner:
         records: list[dict[str, Any]],
         entity_type: str,
         annotation_mode: str,
+        search_options: dict[str, Any] | None = None,
     ) -> list[MappingResult]:
         """Map one chunk under the gate, with the file jobs' retry and stall rules.
 
@@ -503,7 +599,11 @@ class HarmonizeRunner:
         cfg = m.config
         self._check_stop(job)
         cache = caches[annotation_mode]
-        options = {"entity_type": entity_type, "annotation_mode": annotation_mode}
+        options: dict[str, Any] = {"entity_type": entity_type, "annotation_mode": annotation_mode}
+        if search_options:
+            for k, v in search_options.items():
+                if v is not None:
+                    options[k] = v
         keys = [_entity_key(r, options) for r in records]
         results: dict[int, MappingResult] = {}
         for i, key in enumerate(keys):
@@ -526,7 +626,7 @@ class HarmonizeRunner:
                             warnings.simplefilter("always")
                             got = await m.client.map_entities(
                                 batch, entity_type=entity_type, annotation_mode=annotation_mode,
-                                sleep_on_rate_limit=False,
+                                sleep_on_rate_limit=False, **(search_options or {}),
                             )
             except TimeoutError:
                 raise _Fatal(
@@ -642,6 +742,35 @@ class HarmonizeRunner:
         job: HarmonizeJob, common: dict[str, Any], resumed: bool
     ) -> ManyCohortReport | CohortHarmonizationReport:
         if job.kind == "harmonize_many":
+            extra_names = {
+                c["label"]: c["extra_name_columns"]
+                for c in job.cohorts
+                if c.get("extra_name_columns")
+            }
+            cohort_opts = {
+                c["label"]: c["search_options"]
+                for c in job.cohorts
+                if c.get("search_options") is not None
+            }
+            policies = {
+                c["label"]: c["resolution_policy"]
+                for c in job.cohorts
+                if c.get("resolution_policy") is not None
+            }
+            strip_map = {
+                c["label"]: bool(c["strip_names"])
+                for c in job.cohorts
+                if "strip_names" in c
+            }
+            extra_kw: dict[str, Any] = {}
+            if extra_names:
+                extra_kw["extra_name_columns"] = extra_names
+            if cohort_opts:
+                extra_kw["cohort_options"] = cohort_opts
+            if policies:
+                extra_kw["resolution_policies"] = policies
+            if strip_map:
+                extra_kw["strip_names"] = strip_map
             return harmonize_many(
                 {c["label"]: c["path"] for c in job.cohorts},
                 name_columns={c["label"]: c["name_column"] for c in job.cohorts},
@@ -652,6 +781,7 @@ class HarmonizeRunner:
                 store_dir=job.store_dir,
                 # Passing remap_all again on resume would move this job's own saved chunks aside.
                 remap_all=bool(job.options.get("remap_all")) and not resumed,
+                **extra_kw,
                 **common,
             )
         a, b = job.cohorts

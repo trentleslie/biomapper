@@ -89,6 +89,11 @@ from biomapper.harmonize.nway import (
     group_cohorts,
 )
 from biomapper.models import MappingResult
+from biomapper.resolution import (
+    CohortResolutionPolicy,
+    EngineSearchOptions,
+    resolve_cohort_with_policy,
+)
 
 __all__ = ["ArmReport", "GroupDiff", "ManyCohortReport", "ReviewCheck", "harmonize_many"]
 
@@ -624,6 +629,34 @@ def _drilldown_writer(stack: ExitStack, directory: Path | None, arm: str) -> tup
     return sink, path
 
 
+def _normalize_extra_name_columns(
+    value: Any,  # noqa: ANN401
+    labels: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return dict.fromkeys(labels, ())
+    if isinstance(value, Mapping):
+        unknown = [k for k in value if k not in labels]
+        if unknown:
+            raise ValueError(
+                f"extra_name_columns names {unknown}, which is not a cohort label "
+                f"(labels: {list(labels)})"
+            )
+        out: dict[str, tuple[str, ...]] = {}
+        for label in labels:
+            raw = value.get(label)
+            if raw is None:
+                out[label] = ()
+            elif isinstance(raw, str):
+                out[label] = (raw,)
+            else:
+                out[label] = tuple(str(c) for c in raw)
+        return out
+    raise TypeError(
+        "extra_name_columns must be a mapping of {cohort_label: column_or_columns}"
+    )
+
+
 def harmonize_many(
     cohorts: Mapping[str, CohortInput],
     *,
@@ -647,6 +680,11 @@ def harmonize_many(
     remap_all: bool = False,
     on_message: Callable[[str], None] | None = None,
     on_progress: ProgressCallback | None = None,
+    extra_name_columns: Mapping[str, str | Sequence[str]] | None = None,
+    cohort_options: Mapping[str, EngineSearchOptions | Mapping[str, Any]] | None = None,
+    resolution_policies: Mapping[str, CohortResolutionPolicy | Mapping[str, Any]] | None = None,
+    strip_names: bool | Mapping[str, bool] = True,
+    max_retries: int = 0,
 ) -> ManyCohortReport:
     """Harmonize two or more cohort tables, grouping rows across all of them by chosen node.
 
@@ -709,16 +747,55 @@ def harmonize_many(
     names_by = _per_cohort(name_columns, labels, "name_columns", "name")
     vocabs_by = _per_cohort(vocabularies, labels, "vocabularies", None)
     keys_by = _per_cohort(key_columns, labels, "key_columns", None)
+    extra_names_by = _normalize_extra_name_columns(extra_name_columns, labels)
+    raw_options_by = _per_cohort(cohort_options, labels, "cohort_options", None)
+    options_by: dict[str, EngineSearchOptions | None] = {
+        label: (
+            EngineSearchOptions.from_value(raw_options_by[label])
+            if raw_options_by[label] is not None
+            else None
+        )
+        for label in labels
+    }
+    raw_policies_by = _per_cohort(resolution_policies, labels, "resolution_policies", None)
+    policies_by: dict[str, CohortResolutionPolicy | None] = {
+        label: (
+            CohortResolutionPolicy.from_value(raw_policies_by[label])
+            if raw_policies_by[label] is not None
+            else None
+        )
+        for label in labels
+    }
+    strip_explicit = isinstance(strip_names, Mapping)
+    strip_by = _per_cohort(strip_names, labels, "strip_names", True)
+    for label in labels:
+        policy = policies_by[label]
+        if policy is not None:
+            merged_extras = tuple(dict.fromkeys([*extra_names_by[label], *policy.name_columns]))
+            extra_names_by[label] = merged_extras
+            if not strip_explicit:
+                if strip_names is True:
+                    strip_by[label] = policy.strip_names
+            elif label not in strip_names:
+                strip_by[label] = policy.strip_names
+
     read: list[Cohort] = [
-        read_cohort(cohorts[label], label=label, name_column=names_by[label],
-                    vocabularies=vocabs_by[label], key_column=keys_by[label])
+        read_cohort(
+            cohorts[label],
+            label=label,
+            name_column=names_by[label],
+            vocabularies=vocabs_by[label],
+            key_column=keys_by[label],
+            extra_name_columns=extra_names_by[label] or None,
+            strip_names=bool(strip_by[label]),
+        )
         for label in labels
     ]
 
     api_base = base_url or DEFAULT_BASE_URL
     the_mapper: Mapper = mapper or BatchedApiMapper(
         batch_size=batch_size, timeout=timeout, base_url=base_url, api_key=api_key,
-        progress=progress,
+        progress=progress, max_retries=max_retries,
     )
     # The KG build is read before any mapping request, so a mismatch can be refused up front.
     pin_block = (
@@ -785,32 +862,126 @@ def harmonize_many(
 
         def run_arm(arm: str, sent: dict[str, list[dict[str, list[str]]]],
                     base: dict[str, list[MappingResult]] | None) -> ArmReport:
-            # Rows with nothing to send in the identifier arm keep their names-only result.
-            index: list[tuple[str, int]] = []
-            requests: list[dict[str, Any]] = []
-            for c in read:
-                for i, (rec, ids) in enumerate(zip(c.records, sent[c.label], strict=True)):
-                    if base is None or ids:
-                        index.append((c.label, i))
-                        requests.append({"name": rec.name, "identifiers": ids})
-            say(f"{arm} arm: {len(requests)} rows to map")
+            results = {c.label: list(base[c.label]) if base is not None
+                       else [MappingResult(query_name=r.name) for r in c.records] for c in read}
+            reused: dict[str, list[bool]] = {c.label: [] for c in read}
+            policy_diagnostics: dict[str, dict[str, Any]] = {}
+
+            # Partition cohorts: standard default cohorts share one map_requests pass (exact
+            # legacy batching/progress/cache keys); cohorts with custom options or multi-tier
+            # policies run with their explicit engine configuration.
+            standard_cohorts = [
+                c for c in read if policies_by[c.label] is None and options_by[c.label] is None
+            ]
+            custom_cohorts = [
+                c for c in read if policies_by[c.label] is not None or options_by[c.label] is not None
+            ]
+
             on_batch = (
                 (lambda done, total: report_progress(arm, None, done, total, labels))
                 if report_progress.enabled else None
             )
-            outcome = map_requests(the_mapper, requests, store=store.arm(arm),
-                                   entity_type=resolved_category, annotation_mode="missing",
-                                   batch_size=batch_size, on_batch=on_batch)
-            results = {c.label: list(base[c.label]) if base is not None
-                       else [MappingResult(query_name=r.name) for r in c.records] for c in read}
-            reused: dict[str, list[bool]] = {c.label: [] for c in read}
-            for (label, i), res, was_reused in zip(index, outcome.results, outcome.reused,
-                                                   strict=True):
-                results[label][i] = res
-                reused[label].append(was_reused)
+
+            if standard_cohorts:
+                std_index: list[tuple[str, int]] = []
+                std_requests: list[dict[str, Any]] = []
+                for c in standard_cohorts:
+                    for i, (rec, ids) in enumerate(zip(c.records, sent[c.label], strict=True)):
+                        if base is None or ids:
+                            std_index.append((c.label, i))
+                            std_requests.append({"name": rec.name, "identifiers": ids})
+                say(f"{arm} arm: {len(std_requests)} rows to map")
+                outcome = map_requests(
+                    the_mapper,
+                    std_requests,
+                    store=store.arm(arm),
+                    entity_type=resolved_category,
+                    annotation_mode="missing",
+                    batch_size=batch_size,
+                    on_batch=on_batch,
+                )
+                for (label, i), res, was_reused in zip(
+                    std_index, outcome.results, outcome.reused, strict=True
+                ):
+                    results[label][i] = res
+                    reused[label].append(was_reused)
+
+            for c in custom_cohorts:
+                active_indices = [
+                    i
+                    for i, ids in enumerate(sent[c.label])
+                    if base is None or ids
+                ]
+                if not active_indices:
+                    continue
+                policy = policies_by[c.label]
+                opt = options_by[c.label]
+                say(f"{arm} arm ({c.label}): {len(active_indices)} rows to map")
+                if policy is not None:
+                    if len(active_indices) == len(c.records):
+                        sub_cohort = c
+                        sub_sent = sent[c.label]
+                    else:
+                        sub_cohort = Cohort(
+                            label=c.label,
+                            records=tuple(c.records[i] for i in active_indices),
+                            vocabularies=c.vocabularies,
+                            excluded=c.excluded,
+                            source=c.source,
+                            name_column=c.name_column,
+                            key_column=c.key_column,
+                            extra_name_columns=c.extra_name_columns,
+                        )
+                        sub_sent = [sent[c.label][i] for i in active_indices]
+                    p_outcome = resolve_cohort_with_policy(
+                        sub_cohort,
+                        sub_sent,
+                        mapper=the_mapper,
+                        store=store.arm(arm),
+                        policy=policy,
+                        default_entity_type=resolved_category,
+                        annotation_mode="missing",
+                        batch_size=batch_size,
+                        on_batch=(
+                            (lambda done, total, lbl=c.label: report_progress(
+                                arm, lbl, done, total, labels
+                            ))
+                            if report_progress.enabled
+                            else None
+                        ),
+                    )
+                    for pos, row_idx in enumerate(active_indices):
+                        results[c.label][row_idx] = p_outcome.results[pos]
+                        reused[c.label].append(p_outcome.reused[pos])
+                    policy_diagnostics[c.label] = p_outcome.diagnostics
+                else:
+                    c_reqs = [
+                        {"name": c.records[i].name, "identifiers": sent[c.label][i]}
+                        for i in active_indices
+                    ]
+                    c_outcome = map_requests(
+                        the_mapper,
+                        c_reqs,
+                        store=store.arm(arm),
+                        entity_type=resolved_category,
+                        annotation_mode="missing",
+                        batch_size=batch_size,
+                        on_batch=(
+                            (lambda done, total, lbl=c.label: report_progress(
+                                arm, lbl, done, total, labels
+                            ))
+                            if report_progress.enabled
+                            else None
+                        ),
+                        search_options=opt,
+                    )
+                    for pos, row_idx in enumerate(active_indices):
+                        results[c.label][row_idx] = c_outcome.results[pos]
+                        reused[c.label].append(c_outcome.reused[pos])
+
             mapping[arm] = {}
             for c in read:
-                provenance = {
+                provenance: dict[str, Any] = {
                     "arm": arm,
                     "session_id": session_id,
                     "request_checksum": request_checksum(
@@ -827,6 +998,8 @@ def harmonize_many(
                     "n_fresh": len(reused[c.label]) - sum(reused[c.label]),
                     "n_errored": sum(1 for r in results[c.label] if r.error),
                 }
+                if c.label in policy_diagnostics:
+                    provenance["resolution_summary"] = policy_diagnostics[c.label]
                 mapping[arm][c.label] = provenance
                 if directory is not None:
                     _write_json(directory / f"provenance_{arm}_{_safe(c.label)}.json", provenance)
@@ -912,6 +1085,13 @@ def harmonize_many(
                     "vocabularies": {v: list(cols) for v, cols in c.vocabularies.items()},
                     "source": dict(c.source),
                     "n_excluded": len(c.excluded),
+                    **({"extra_name_columns": list(c.extra_name_columns)}
+                       if c.extra_name_columns else {}),
+                    **({"search_options": options_by[c.label].to_dict()}
+                       if options_by[c.label] is not None else {}),
+                    **({"resolution_policy": policies_by[c.label].to_dict()}
+                       if policies_by[c.label] is not None else {}),
+                    **({"strip_names": False} if not strip_by[c.label] else {}),
                 }
                 for c in read
             },

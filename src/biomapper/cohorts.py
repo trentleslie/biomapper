@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import time
 import warnings
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -46,7 +47,7 @@ from typing import Any, Protocol
 from biomapper._pins import api_health, collect_pins
 from biomapper._provenance import DEFAULT_KESTREL_URL
 from biomapper._version import resolve_version
-from biomapper.client import DEFAULT_BASE_URL
+from biomapper.client import DEFAULT_BASE_URL, BioMapperClient
 from biomapper.harmonize.curies import canonical_prefix, curie_set
 from biomapper.harmonize.linking import (
     HarmonizationResult,
@@ -353,6 +354,7 @@ class CohortRecord:
     name: str
     row: int  # position in the input table (0-based, data rows only)
     identifiers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    extra_names: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -366,6 +368,7 @@ class Cohort:
     source: Mapping[str, Any]
     name_column: str
     key_column: str | None
+    extra_name_columns: tuple[str, ...] = ()
 
 
 CohortInput = Any  # a DataFrame, a list of dicts, or a TSV/CSV path
@@ -421,6 +424,8 @@ def read_cohort(
     name_column: str = "name",
     vocabularies: Mapping[str, str | Sequence[str]] | None = None,
     key_column: str | None = None,
+    extra_name_columns: Sequence[str] | None = None,
+    strip_names: bool = True,
 ) -> Cohort:
     """Normalize one cohort table into keyed records.
 
@@ -428,12 +433,16 @@ def read_cohort(
     otherwise ``"{row}|{name}"``, so repeated names never collide. Rows with a blank name are
     excluded and reported. Identifier cells are cleaned (``clean_id``), split on ``,``, ``;`` and
     ``|`` (and ``_`` for UniProt accessions), and de-duplicated across a vocabulary's columns.
+    When ``strip_names=False``, cell values in ``name_column`` and ``extra_name_columns`` are kept
+    verbatim without stripping or editing.
     """
     rows, columns, source = _table_rows(table)
     declared = _normalize_declaration(vocabularies)
+    extra_cols = tuple(dict.fromkeys(str(c) for c in (extra_name_columns or ())))
     needed = [("name column", name_column)]
     if key_column is not None:
         needed.append(("key column", key_column))
+    needed += [("extra name column", c) for c in extra_cols]
     needed += [(f"{v} column", c) for v, cols in declared.items() for c in cols]
     for role, column in needed:
         if column not in columns:
@@ -449,7 +458,7 @@ def read_cohort(
         if _blank(raw_name):
             excluded.append({"row": i, "reason": "blank name"})
             continue
-        name = str(raw_name).strip()
+        name = str(raw_name).strip() if strip_names else str(raw_name)
         if key_column is not None:
             key = clean_id(row.get(key_column))
             if key is None:
@@ -469,7 +478,14 @@ def read_cohort(
                 values.extend(v for v in _split_codes(row.get(col), vocab) if v not in values)
             if values:
                 ids[vocab] = tuple(values)
-        records.append(CohortRecord(key=key, name=name, row=i, identifiers=ids))
+        extras: dict[str, str] = {}
+        for col in extra_cols:
+            raw_extra = row.get(col)
+            if not _blank(raw_extra):
+                extras[col] = str(raw_extra).strip() if strip_names else str(raw_extra)
+        records.append(
+            CohortRecord(key=key, name=name, row=i, identifiers=ids, extra_names=extras)
+        )
 
     source = {**source, "n_rows": len(rows), "n_records": len(records)}
     return Cohort(
@@ -480,6 +496,7 @@ def read_cohort(
         source=source,
         name_column=name_column,
         key_column=key_column,
+        extra_name_columns=extra_cols,
     )
 
 
@@ -524,30 +541,147 @@ class BatchedApiMapper:
         base_url: str | None = None,
         api_key: str | None = None,
         progress: bool = False,
+        annotators: Sequence[str] | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
+        vocab: str | Sequence[str] | None = None,
+        array_delimiters: Sequence[str] | None = None,
+        max_retries: int = 0,
+        retry_backoff_s: float = 1.0,
     ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+        if max_retries < 0:
+            raise ValueError(f"max_retries must be at least 0, got {max_retries}")
+        BioMapperClient._check_bounds("candidate_limit", candidate_limit)
+        BioMapperClient._check_bounds("kestrel_top_n", kestrel_top_n)
         self.batch_size = batch_size
         self.timeout = timeout
         self.base_url = base_url
         self.api_key = api_key
         self.progress = progress
+        self.annotators = list(annotators) if annotators is not None else None
+        self.prefer_human = prefer_human
+        self.prefer_canonical = prefer_canonical
+        self.candidate_limit = candidate_limit
+        self.kestrel_top_n = kestrel_top_n
+        self.vocab = (
+            vocab if vocab is None or isinstance(vocab, str) else list(vocab)
+        )
+        self.array_delimiters = (
+            list(array_delimiters) if array_delimiters is not None else None
+        )
+        self.max_retries = max_retries
+        self.retry_backoff_s = retry_backoff_s
+
+    def _call_batch(
+        self,
+        batch: list[dict[str, Any]],
+        *,
+        entity_type: str,
+        annotation_mode: str,
+        option_kwargs: dict[str, Any],
+    ) -> list[MappingResult]:
+        results = map_entities(
+            batch,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            entity_type=entity_type,
+            annotation_mode=annotation_mode,
+            timeout=self.timeout,
+            **option_kwargs,
+        )
+        if not self.max_retries:
+            return results
+        merged = list(results)
+        for attempt in range(self.max_retries):
+            failed_indices = [i for i, r in enumerate(merged) if r.error]
+            if not failed_indices:
+                break
+            if self.retry_backoff_s > 0:
+                time.sleep(self.retry_backoff_s * (2**attempt))
+            retry_batch = [batch[i] for i in failed_indices]
+            retried = map_entities(
+                retry_batch,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                entity_type=entity_type,
+                annotation_mode=annotation_mode,
+                timeout=self.timeout,
+                **option_kwargs,
+            )
+            for idx, res in zip(failed_indices, retried, strict=True):
+                merged[idx] = res
+        return merged
 
     def __call__(
-        self, records: list[dict[str, Any]], *, entity_type: str, annotation_mode: str
+        self,
+        records: list[dict[str, Any]],
+        *,
+        entity_type: str,
+        annotation_mode: str,
+        annotators: Sequence[str] | None = None,
+        prefer_human: bool | None = None,
+        prefer_canonical: bool | None = None,
+        candidate_limit: int | None = None,
+        kestrel_top_n: int | None = None,
+        vocab: str | Sequence[str] | None = None,
+        array_delimiters: Sequence[str] | None = None,
     ) -> list[MappingResult]:
+        eff_candidate_limit = (
+            candidate_limit if candidate_limit is not None else self.candidate_limit
+        )
+        eff_kestrel_top_n = (
+            kestrel_top_n if kestrel_top_n is not None else self.kestrel_top_n
+        )
+        BioMapperClient._check_bounds("candidate_limit", eff_candidate_limit)
+        BioMapperClient._check_bounds("kestrel_top_n", eff_kestrel_top_n)
+
+        eff_annotators = (
+            list(annotators) if annotators is not None else self.annotators
+        )
+        eff_prefer_human = (
+            prefer_human if prefer_human is not None else self.prefer_human
+        )
+        eff_prefer_canonical = (
+            prefer_canonical if prefer_canonical is not None else self.prefer_canonical
+        )
+        eff_vocab = (
+            (vocab if isinstance(vocab, str) else list(vocab))
+            if vocab is not None
+            else self.vocab
+        )
+        eff_delims = (
+            list(array_delimiters)
+            if array_delimiters is not None
+            else self.array_delimiters
+        )
+
+        option_kwargs: dict[str, Any] = {}
+        for key, value in (
+            ("annotators", eff_annotators),
+            ("prefer_human", eff_prefer_human),
+            ("prefer_canonical", eff_prefer_canonical),
+            ("candidate_limit", eff_candidate_limit),
+            ("kestrel_top_n", eff_kestrel_top_n),
+            ("vocab", eff_vocab),
+            ("array_delimiters", eff_delims),
+        ):
+            if value is not None:
+                option_kwargs[key] = value
+
         out: list[MappingResult] = []
         total = len(records)
         for start in range(0, total, self.batch_size):
             batch = records[start : start + self.batch_size]
             out.extend(
-                map_entities(
+                self._call_batch(
                     batch,
-                    api_key=self.api_key,
-                    base_url=self.base_url,
                     entity_type=entity_type,
                     annotation_mode=annotation_mode,
-                    timeout=self.timeout,
+                    option_kwargs=option_kwargs,
                 )
             )
             if self.progress:

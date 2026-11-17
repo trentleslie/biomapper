@@ -48,6 +48,7 @@ from biomapper._checkpoint import (
 )
 from biomapper._provenance import UNKNOWN
 from biomapper.models import MappingResult
+from biomapper.resolution import EngineSearchOptions, call_mapper_with_options
 
 __all__ = [
     "ARMS",
@@ -325,8 +326,21 @@ def _entity_key(request: dict[str, Any], options: dict[str, Any]) -> str:
 
 
 def _call(
-    mapper: MapperFn, requests: list[dict[str, Any]], *, entity_type: str, annotation_mode: str
+    mapper: MapperFn,
+    requests: list[dict[str, Any]],
+    *,
+    entity_type: str,
+    annotation_mode: str,
+    search_options: EngineSearchOptions | None = None,
 ) -> list[MappingResult]:
+    if search_options is not None:
+        return call_mapper_with_options(
+            mapper,
+            requests,
+            entity_type=entity_type,
+            annotation_mode=annotation_mode,
+            search_options=search_options,
+        )
     results = list(mapper(requests, entity_type=entity_type, annotation_mode=annotation_mode))
     if len(results) != len(requests):
         raise RuntimeError(
@@ -345,6 +359,7 @@ def map_requests(
     annotation_mode: str,
     batch_size: int | None = None,
     on_batch: Callable[[int, int], None] | None = None,
+    search_options: EngineSearchOptions | None = None,
 ) -> MapOutcome:
     """Map ``requests`` (``{"name", "identifiers"}``), serving saved results where allowed.
 
@@ -357,7 +372,14 @@ def map_requests(
     Without a store the misses go to the mapper in one call, unless ``on_batch`` is given, in
     which case they go in ``batch_size`` chunks so there is something to report between them.
     """
-    options = {"entity_type": entity_type, "annotation_mode": annotation_mode}
+    options = (
+        search_options.to_cache_options(entity_type, annotation_mode)
+        if search_options is not None
+        else {"entity_type": entity_type, "annotation_mode": annotation_mode}
+    )
+    effective_entity = (
+        search_options.entity_type or entity_type if search_options is not None else entity_type
+    )
     keys = [_entity_key(r, options) for r in requests]
     cache = store.cache if store is not None else None
     found: dict[str, MappingResult] = {}
@@ -386,7 +408,13 @@ def map_requests(
         batch_keys = order[start : start + chunk]
         batch = [{"name": first[k]["name"], "identifiers": dict(first[k].get("identifiers") or {})}
                  for k in batch_keys]
-        results = _call(mapper, batch, entity_type=entity_type, annotation_mode=annotation_mode)
+        results = _call(
+            mapper,
+            batch,
+            entity_type=effective_entity,
+            annotation_mode=annotation_mode,
+            search_options=search_options,
+        )
         keyed = list(zip(batch_keys, results, strict=True))
         if cache is not None and store is not None:
             cache.commit_batch(vocab=store.arm, batch_index=store.next_batch_index(),

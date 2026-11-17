@@ -78,6 +78,12 @@ from biomapper.models import (
     ResolutionCertificate,
     VocabularyInfo,
 )
+from biomapper.resolution import (
+    CohortResolutionPolicy,
+    EngineSearchOptions,
+    ResolutionTier,
+    default_protein_engine_policy,
+)
 
 # Single-sourced from the installed distribution metadata, which Poetry builds from
 # ``pyproject.toml``. It is deliberately NOT a literal here: a second literal is a second source of
@@ -107,6 +113,10 @@ __all__ = [
     # Two or more cohorts in one pinned run: node-anchored groups plus review queues
     "harmonize_many",
     "ManyCohortReport",
+    "CohortResolutionPolicy",
+    "EngineSearchOptions",
+    "ResolutionTier",
+    "default_protein_engine_policy",
     # Structured progress for both (on_progress=). Resumable background jobs for an asyncio
     # application live in biomapper.jobs (HarmonizeJobs), imported on demand.
     "HarmonizeProgress",
