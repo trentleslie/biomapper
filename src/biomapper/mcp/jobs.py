@@ -61,7 +61,19 @@ from biomapper.mcp import tools
 from biomapper.mcp._storage import private_dir, utc, write_private
 from biomapper.mcp.config import ServerConfig
 from biomapper.mcp.gate import GateBusy, RequestGate
-from biomapper.mcp.judgments import CHOICES_COLUMNS, CHOICES_MARKER
+from biomapper.mcp.judgments import JudgmentError
+from biomapper.mcp.judgments import (
+    check_choices_writable as _check_choices_writable,
+)
+from biomapper.mcp.judgments import (
+    is_server_choices as _is_server_choices_file,
+)
+from biomapper.mcp.judgments import (
+    tsv_line as _tsv_line,
+)
+from biomapper.mcp.judgments import (
+    write_choices as _write_choices_file,
+)
 from biomapper.mcp.references import RefStore
 from biomapper.models import MappingResult
 
@@ -610,16 +622,6 @@ def _output_row(row: InputRow, result: MappingResult | None, error: str | None) 
         json.dumps(result.kg_equivalent_ids, sort_keys=True) if result.kg_equivalent_ids else "",
         shaped.error or "",
     ]
-
-
-def _tsv_line(values: list[Any]) -> str:
-    import io
-
-    buf = io.StringIO()
-    csv.writer(buf, delimiter="\t", lineterminator="\n").writerow(
-        ["" if v is None else v for v in values]
-    )
-    return buf.getvalue()
 
 
 def _cache_pin(pins: dict[str, Any], base_url: str, options: dict[str, Any]) -> dict[str, Any]:
@@ -1507,40 +1509,23 @@ class JobManager:
     @staticmethod
     def _is_server_choices(path: Path) -> bool:
         """Whether ``path`` is a regular server-owned choices file (marker on line 1)."""
-        if path.is_symlink() or not path.is_file():
-            return False
-        try:
-            with path.open(encoding="utf-8") as fh:
-                return fh.readline().rstrip("\r\n") == CHOICES_MARKER
-        except (OSError, UnicodeDecodeError):
-            return False
+        return _is_server_choices_file(path)
 
     def check_choices_writable(self, job: AnyJob) -> None:
         """Refuse unless ``choices.tsv`` is absent or a server-owned file (marker on line 1)."""
-        path = job.choices_path
-        if path.is_symlink():
-            raise JobError(f"{path} is a link; record_suggestion never writes through links.")
-        if not path.exists():
-            return
-        if not self._is_server_choices(path):
-            raise JobError(
-                f"{path} exists and is not the server-owned choices file, so it is left alone. "
-                "Move it away, then record the suggestion again."
-            )
+        try:
+            _check_choices_writable(job.choices_path)
+        except JudgmentError as exc:
+            raise JobError(str(exc)) from None
 
     def write_choices(self, job: AnyJob, rows: list[list[Any]]) -> Path:
         """Atomically replace the job's ``choices.tsv`` with ``rows`` under the marker line."""
-        self.check_choices_writable(job)
-        path = job.choices_path
-        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
         # A harmonize job's files are owner-only; map_file's sidecars keep their 1.7.0 mode.
-        with _create_exclusive(tmp, 0o600 if isinstance(job, HarmonizeJob) else 0o644) as fh:
-            fh.write(CHOICES_MARKER + "\n")
-            fh.write(_tsv_line(CHOICES_COLUMNS))
-            for row in rows:
-                fh.write(_tsv_line(row))
-        os.replace(tmp, path)
-        return path
+        mode = 0o600 if isinstance(job, HarmonizeJob) else 0o644
+        try:
+            return _write_choices_file(job.choices_path, rows, mode=mode)
+        except JudgmentError as exc:
+            raise JobError(str(exc)) from None
 
     def _write_weak(
         self, job: Job, rows: list[InputRow], cache: EntityCache, pins: dict[str, Any]

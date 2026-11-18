@@ -36,8 +36,10 @@ import csv
 import hashlib
 import json
 import logging
+import re
 import shutil
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -47,7 +49,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from biomapper._pins import kg_build_label
-from biomapper.exceptions import BioMapperError
+from biomapper.exceptions import BioMapperError, BioMapperRateLimitError
 from biomapper.harmonize.nway import NO_NODE
 from biomapper.many_cohorts import ARM_NAMES_ONLY, ManyCohortReport
 from biomapper.mcp import candidates as cands
@@ -708,27 +710,96 @@ async def build_and_capture(
     m._save(job)
 
 
+_RETRY_SECONDS = re.compile(r"retry[^0-9]*(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+RATE_LIMIT_MAX_RETRIES = 3
+
+
+def _rate_limit_delay(
+    exc_or_message: BaseException | str | None, attempt: int, backoff_s: float
+) -> float:
+    if backoff_s <= 0:
+        return 0.01
+    retry_after: float | None = None
+    if isinstance(exc_or_message, BioMapperRateLimitError):
+        retry_after = exc_or_message.retry_after
+    elif isinstance(exc_or_message, str):
+        match = _RETRY_SECONDS.search(exc_or_message)
+        if match is not None:
+            retry_after = float(match.group(1))
+    if retry_after is not None and retry_after > 0:
+        return min(max(retry_after, backoff_s), 60.0)
+    return min(backoff_s * (attempt + 1), 60.0)
+
+
+async def fetch_with_429_retry(
+    client: Any,  # noqa: ANN401 — BioMapperClient
+    gate: Any,  # noqa: ANN401 — RequestGate
+    *,
+    name: str,
+    category: str,
+    identifiers: dict[str, str] | None = None,
+    annotation_mode: str = "missing",
+    n: int,
+    timeout_s: float,
+    backoff_s: float,
+    stop_check: Callable[[], None] | None = None,
+) -> tuple[MappingResult | None, str | None]:
+    """One candidate re-map under the gate with bounded 429 backoff outside the gate."""
+    payload = [{"name": name, "identifiers": dict(identifiers or {})}]
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        if stop_check is not None:
+            stop_check()
+        wait_s: float | None = None
+        try:
+            with anyio.fail_after(timeout_s):
+                async with gate.hold(wait_budget_s=None):
+                    results = await client.map_entities(
+                        payload,
+                        entity_type=category,
+                        annotation_mode=annotation_mode,
+                        kestrel_top_n=n,
+                        sleep_on_rate_limit=False,
+                    )
+        except TimeoutError:
+            return None, "timeout"
+        except BioMapperRateLimitError as exc:
+            if attempt >= RATE_LIMIT_MAX_RETRIES:
+                return None, "http_429"
+            wait_s = _rate_limit_delay(exc, attempt, backoff_s)
+        except (BioMapperError, httpx.HTTPError, OSError) as exc:
+            return None, cands.reason_for_exception(exc)
+        else:
+            if len(results) != 1:
+                return None, "upstream_error"
+            result = results[0]
+            if cands.remap_error(result) == "http_429" and attempt < RATE_LIMIT_MAX_RETRIES:
+                wait_s = _rate_limit_delay(result.error, attempt, backoff_s)
+            else:
+                return result, None
+        await anyio.sleep(wait_s)
+    return None, "http_429"
+
+
 async def _fetch(
     runner: HarmonizeRunner, job: HarmonizeJob, name: str, category: str, n: int
 ) -> tuple[MappingResult | None, str | None]:
     """One candidate re-map under the gate. A failure is a reason, never an exception."""
     m = runner.m
-    if job.state == "cancelled" or m.shutting_down:
-        raise _Stop
-    try:
-        with anyio.fail_after(m.config.bridge_timeout_s):
-            async with m.gate.hold(wait_budget_s=None):
-                results = await m.client.map_entities(
-                    [{"name": name, "identifiers": {}}], entity_type=category,
-                    annotation_mode="missing", kestrel_top_n=n, sleep_on_rate_limit=False,
-                )
-    except TimeoutError:
-        return None, "timeout"
-    except (BioMapperError, httpx.HTTPError, OSError) as exc:
-        return None, cands.reason_for_exception(exc)
-    if len(results) != 1:
-        return None, "upstream_error"
-    return results[0], None
+
+    def check() -> None:
+        if job.state == "cancelled" or m.shutting_down:
+            raise _Stop
+
+    return await fetch_with_429_retry(
+        m.client,
+        m.gate,
+        name=name,
+        category=category,
+        n=n,
+        timeout_s=m.config.bridge_timeout_s,
+        backoff_s=m.config.systemic_backoff_s,
+        stop_check=check,
+    )
 
 
 def _names_in(result: MappingResult) -> dict[str, str]:
@@ -757,6 +828,8 @@ async def _capture(
     cfg = m.config
     n = cfg.capture_top_n
     budget = cfg.capture_max_entities - index.capture_requests
+    pace_s = min(1.1, cfg.systemic_backoff_s) if cfg.systemic_backoff_s > 0 else 0.0
+    last_fetch_at: float | None = None
     failures = 0
     known: dict[str, str] = {}
     for entry in index.entries:  # names captured before an interruption
@@ -779,6 +852,16 @@ async def _capture(
         index.capture_requests += 1
         store.save(index)
 
+    async def paced_fetch(name: str) -> tuple[MappingResult | None, str | None]:
+        nonlocal last_fetch_at
+        if pace_s > 0 and last_fetch_at is not None:
+            wait = pace_s - (cfg.monotonic() - last_fetch_at)
+            if wait > 0:
+                await anyio.sleep(wait)
+        charge()
+        last_fetch_at = cfg.monotonic()
+        return await _fetch(runner, job, name, category, n)
+
     for entry in index.entries:
         changed = False
         if entry.kind == "row":
@@ -790,8 +873,7 @@ async def _capture(
                 entry.candidates_reason = ("capture_halted" if failures >= CAPTURE_HALT_AFTER
                                            else "over_capture_cap")
             else:
-                charge()
-                result, reason = await _fetch(runner, job, entry.query_name, category, n)
+                result, reason = await paced_fetch(entry.query_name)
                 try:
                     record = m.refs.load(entry.ref)
                 except RefError:
@@ -819,8 +901,7 @@ async def _capture(
                 elif spent():
                     side.node_name_status = "not_captured"
                 else:
-                    charge()
-                    result, reason = await _fetch(runner, job, side.probe_name, category, n)
+                    result, reason = await paced_fetch(side.probe_name)
                     if result is None or cands.remap_error(result) is not None:
                         side.node_name_status = "fetch_failed"
                         failures += 1

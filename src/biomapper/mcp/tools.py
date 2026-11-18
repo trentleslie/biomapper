@@ -23,6 +23,7 @@ from biomapper.exceptions import (
     BioMapperServerError,
     BioMapperTimeoutError,
 )
+from biomapper.harmonize.curies import curie_set, is_structure_curie
 from biomapper.models import MappingResult
 
 EntityStatus = Literal["resolved", "unresolved", "refused", "error"]
@@ -243,6 +244,7 @@ def entity_status(result: MappingResult) -> EntityStatus:
 
 WEAK_STATUSES = frozenset({"unresolved", "refused"})
 WEAK_CERTIFICATES = frozenset({"uncorroborated", "contradicted"})
+WEAK_NON_SM_SCORE_THRESHOLD = 2.0
 # The Unit 0 spike (2026-11-09) found certificate ``unavailable`` hid engine errors on small
 # molecules (0 of 11 engine-right), so it is weak there. For genes and proteins the certificate is
 # structural and ``unavailable`` is routine, so it is not.
@@ -273,6 +275,23 @@ def weak_trigger(result: MappingResult, entity_type: str) -> str | None:
         return certificate
     if certificate == "unavailable" and is_small_molecule(entity_type):
         return "unavailable"
+    if (
+        not result.chosen_kg_id
+        or is_structure_curie(result.chosen_kg_id)
+        or not curie_set(result.chosen_kg_id, result.kg_equivalent_ids)
+    ):
+        return "no_node"
+    if result.max_annotator_score is not None and (
+        result.confidence_score is None
+        or result.max_annotator_score > result.confidence_score + 1e-6
+    ):
+        return "outscored"
+    if (
+        not is_small_molecule(entity_type)
+        and result.confidence_score is not None
+        and result.confidence_score < WEAK_NON_SM_SCORE_THRESHOLD
+    ):
+        return "low_confidence"
     return None
 
 

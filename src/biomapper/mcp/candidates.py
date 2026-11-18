@@ -50,7 +50,7 @@ from biomapper.models import MappingResult
 logger = logging.getLogger("biomapper.mcp.candidates")
 
 MAX_TEXT = 120
-MAX_SYNONYMS = 3
+MAX_SYNONYMS = 12
 MAX_CATEGORIES = 5
 
 MismatchReason = Literal["build_changed", "choice_changed"]
@@ -204,25 +204,38 @@ def compact(
             score = row.get("score")
             score = float(score) if isinstance(score, int | float) else None
             item = merged.get(curie)
+            name = sanitize(row.get("name"))
+            synonyms = [s for s in (sanitize(s) for s in _as_list(row.get("synonyms"))) if s]
+            categories = [
+                c for c in (sanitize(c, 60) for c in _as_list(row.get("categories"))) if c
+            ]
             if item is None:
                 key = _norm_curie(curie)
                 relation: Literal["equals", "equivalent"] | None = (
                     "equals" if key in chosen else "equivalent" if key in equivalents else None
                 )
-                synonyms = [sanitize(s) for s in _as_list(row.get("synonyms"))]
                 merged[curie] = CandidateItem(
                     curie=curie,
-                    name=sanitize(row.get("name")),
-                    synonyms=[s for s in synonyms if s][:MAX_SYNONYMS],
-                    categories=[c for c in (sanitize(c, 60)
-                                            for c in _as_list(row.get("categories"))) if c][
-                        :MAX_CATEGORIES
-                    ],
+                    name=name,
+                    synonyms=synonyms[:MAX_SYNONYMS],
+                    categories=categories[:MAX_CATEGORIES],
                     score=score,
                     endpoints=[endpoint] if endpoint else [],
                     relation=relation,
                 )
                 continue
+            if not item.name and name:
+                item.name = name
+            for syn in synonyms:
+                if len(item.synonyms) >= MAX_SYNONYMS:
+                    break
+                if syn not in item.synonyms:
+                    item.synonyms.append(syn)
+            for cat in categories:
+                if len(item.categories) >= MAX_CATEGORIES:
+                    break
+                if cat not in item.categories:
+                    item.categories.append(cat)
             if score is not None and (item.score is None or score > item.score):
                 item.score = score
             if endpoint and endpoint not in item.endpoints:

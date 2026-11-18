@@ -14,9 +14,14 @@ so history is kept.
 
 from __future__ import annotations
 
+import csv
+import io
+import os
 import secrets
 import time
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -324,6 +329,25 @@ class SuggestionStore:
             ])
         return rows
 
+    @staticmethod
+    def _row_sort_key(key: str) -> tuple[int, str]:
+        return (int(key), key) if key.isdigit() else (1 << 62, key)
+
+    @staticmethod
+    def _suggestion_row(key: str, ref_id: str, current: Suggestion) -> list[object]:
+        return [
+            key,
+            current.query.name,
+            ref_id,
+            current.weak_trigger or "",
+            current.engine.chosen_kg_id or current.engine.primary_curie or "",
+            current.engine.certificate_state or "",
+            current.choice,
+            current.choice_source,
+            current.rationale,
+            current.recorded_utc,
+        ]
+
     def job_rows(self, job_id: str) -> list[list[object]]:
         """``choices.tsv`` rows: the current suggestion of every ref of one job."""
         refs_dir = self.refs.jobs_dir / job_id / "refs"
@@ -336,15 +360,86 @@ class SuggestionStore:
             if current is None:
                 continue
             key = current.row_key or ""
-            order = (int(key), key) if key.isdigit() else (1 << 62, key)
-            rows.append((order, [
-                key, current.query.name, ref_id, current.weak_trigger or "",
-                current.engine.chosen_kg_id or current.engine.primary_curie or "",
-                current.engine.certificate_state or "", current.choice, current.choice_source,
-                current.rationale, current.recorded_utc,
-            ]))
+            rows.append((self._row_sort_key(key), self._suggestion_row(key, ref_id, current)))
         rows.sort(key=lambda r: (r[0], str(r[1][2])))
         return [r for _, r in rows]
+
+    def cohort_choice_rows(self, row_refs: Sequence[tuple[str, str]]) -> list[list[object]]:
+        """``choices.tsv`` rows expanded per explicit ``(cohort_key, ref_id)`` pair.
+
+        ``job_rows`` keeps one row per ref (which joins multiple matching cohort rows into a
+        summary key like ``twinsuk:8467-9 (+1 more rows)``). Downstream per-row overlays need the
+        exact cohort row ``key`` (e.g., each SomaScan ``SeqId``) paired with its reviewed ``ref_id``.
+        """
+        rows: list[tuple[tuple[int, str], list[object]]] = []
+        seen_keys: set[str] = set()
+        for row_key, ref_id in row_refs:
+            key = str(row_key).strip()
+            if not key or key in seen_keys:
+                continue
+            current = self.current(ref_id)
+            if current is None:
+                continue
+            seen_keys.add(key)
+            rows.append((self._row_sort_key(key), self._suggestion_row(key, ref_id, current)))
+        rows.sort(key=lambda r: (r[0], str(r[1][2])))
+        return [r for _, r in rows]
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def tsv_line(values: Sequence[Any]) -> str:
+    """Format one TSV row with Nones rendered as empty cells."""
+    buf = io.StringIO()
+    csv.writer(buf, delimiter="\t", lineterminator="\n").writerow(
+        ["" if v is None else v for v in values]
+    )
+    return buf.getvalue()
+
+
+def is_server_choices(path: Path) -> bool:
+    """Whether ``path`` is a regular server-owned choices file (marker on line 1)."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open(encoding="utf-8") as fh:
+            return fh.readline().rstrip("\r\n") == CHOICES_MARKER
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def check_choices_writable(path: Path) -> None:
+    """Refuse unless ``choices.tsv`` is absent or a server-owned file (marker on line 1)."""
+    if path.is_symlink():
+        raise JudgmentError(f"{path} is a link; record_suggestion never writes through links.")
+    if not path.exists():
+        return
+    if not is_server_choices(path):
+        raise JudgmentError(
+            f"{path} exists and is not the server-owned choices file, so it is left alone. "
+            "Move it away, then record the suggestion again."
+        )
+
+
+def write_choices(path: Path, rows: Sequence[Sequence[Any]], *, mode: int = 0o600) -> Path:
+    """Atomically replace ``path`` with ``rows`` under the server-owned choices marker line."""
+    check_choices_writable(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(CHOICES_MARKER + "\n")
+            fh.write(tsv_line(CHOICES_COLUMNS))
+            for row in rows:
+                fh.write(tsv_line(row))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def suggestion_lookup(

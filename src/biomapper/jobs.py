@@ -60,12 +60,17 @@ from types import TracebackType
 from typing import Any, Literal
 
 import anyio
+import anyio.to_thread
 
-from biomapper._provenance import DEFAULT_KESTREL_URL
+from biomapper._pins import KESTREL_LABEL, kg_build_label
+from biomapper._provenance import DEFAULT_KESTREL_URL, fetch_kg_build_info
 from biomapper.client import DEFAULT_BASE_URL, BioMapperClient
-from biomapper.cohorts import REPORT_FILENAME, HarmonizeProgress
+from biomapper.cohorts import REPORT_FILENAME, HarmonizeProgress, resolve_category
+from biomapper.mcp import candidates as _cands
 from biomapper.mcp import judgments as _judgments
 from biomapper.mcp import review_entries as _review
+from biomapper.mcp._storage import utc as _utc
+from biomapper.mcp.candidates import RefCandidates
 from biomapper.mcp.config import ServerConfig
 from biomapper.mcp.gate import RequestGate
 from biomapper.mcp.harmonize_jobs import CohortSpec
@@ -77,7 +82,10 @@ from biomapper.mcp.jobs import (
     JobManager,
     ReviewCounts,
 )
+from biomapper.mcp.judgments import JudgmentError, SuggestionResult, SuggestionStore
+from biomapper.mcp.references import RefError, RefRecord, RefStore, parse_ref
 from biomapper.mcp.review_entries import ReviewItemDetail, ReviewItemsPage, ReviewItemSummary
+from biomapper.models import MappingResult
 
 __all__ = [
     "FINISHED_STATES",
@@ -89,10 +97,14 @@ __all__ = [
     "HarmonizeStatus",
     "JobError",
     "JobProgressCallback",
+    "RefCandidates",
+    "RefRecord",
     "ReviewCounts",
     "ReviewItemDetail",
     "ReviewItemSummary",
     "ReviewItemsPage",
+    "SuggestionResult",
+    "SuggestionStore",
     "load_report",
 ]
 
@@ -456,3 +468,229 @@ class HarmonizeJobs:
         if entry is None:
             raise JobError(f"No review item {ref!r} in job {job_id}.")
         return _review.detail(entry, index, self._suggestion_of()(entry))
+
+    @property
+    def refs(self) -> RefStore:
+        """Server-issued ref store for this job manager."""
+        return self._m.refs
+
+    @property
+    def suggestions(self) -> SuggestionStore:
+        """Server-owned suggestion store backed by :attr:`refs`."""
+        return SuggestionStore(self._m.refs, wall_clock=self._config.wall_clock)
+
+    def load_ref(self, ref: str) -> RefRecord:
+        """Load one review reference, verifying format and ``roots`` ownership."""
+        try:
+            kind, job_id = parse_ref(ref)
+        except RefError as exc:
+            raise JobError(str(exc)) from None
+        if kind == "link":
+            raise JobError(f"Reference {ref!r} is a link ref, not a row ref.")
+        try:
+            record = self._m.refs.load(ref)
+        except RefError as exc:
+            raise JobError(str(exc)) from None
+        if record.source == "job":
+            self._harmonize_job(record.job_id or job_id or "")
+        return record
+
+    def issue_review_ref(
+        self,
+        job_id: str,
+        *,
+        name: str,
+        result: MappingResult,
+        weak_trigger: str,
+        row_key: str | None = None,
+        entity_type: str | None = None,
+        identifiers: Mapping[str, str] | None = None,
+        annotation_mode: str = "missing",
+    ) -> RefRecord:
+        """Issue a job-scoped ref for an additional suspect row on a finished harmonize job."""
+        job = self._finished(job_id, "review refs are")
+        category = entity_type or job.category or resolve_category(job.entity)
+        return self._m.refs.issue(
+            source="job",
+            job_id=job.job_id,
+            row_key=row_key,
+            query={
+                "name": name,
+                "entity_type": category,
+                "identifiers": dict(identifiers or {}),
+                "annotation_mode": annotation_mode,
+            },
+            result=result,
+            weak_trigger=weak_trigger,
+            kg_build=job.kg_build,
+        )
+
+    async def _fresh_build(self, fallback_build: str) -> str:
+        fresh: tuple[str, Any, str | None] | None = None
+        with anyio.move_on_after(5.0):
+            fresh = await anyio.to_thread.run_sync(
+                lambda: fetch_kg_build_info(self._config.kestrel_url),
+                abandon_on_cancel=True,
+            )
+        if fresh is None or fresh[2] is not None:
+            return fallback_build
+        version, kg, _ = fresh
+        kestrel = {
+            "url": self._config.kestrel_url,
+            "kestrel_version": version,
+            "kg_build": kg.model_dump(),
+            "error": None,
+            "label": KESTREL_LABEL,
+        }
+        return kg_build_label({"kestrel": kestrel})
+
+    async def fetch_candidates(
+        self,
+        ref: str,
+        *,
+        n: int | None = None,
+        use_captured: bool = True,
+        pace_s: float = 0.0,
+    ) -> RefCandidates:
+        """Return captured candidates for ``ref`` or re-map to fetch top-``n`` Kestrel candidates."""
+        cfg = self._config
+        top_n = cfg.candidates_default_n if n is None else n
+        if not 1 <= top_n <= cfg.candidates_max_n:
+            raise JobError(f"n must be between 1 and {cfg.candidates_max_n} (got {top_n}).")
+        record = self.load_ref(ref)
+        if use_captured:
+            final = record
+            for _ in range(5):
+                if not final.superseded_by:
+                    break
+                try:
+                    final = self._m.refs.load(final.superseded_by)
+                except RefError:
+                    final = record
+                    break
+            stored = final.candidates
+            if stored is not None and stored.status in ("present", "none_searched") and stored.n >= top_n:
+                return RefCandidates(
+                    ref=final.ref_id,
+                    query_name=_cands.sanitize(final.query.name),
+                    weak_trigger=final.weak_trigger,
+                    engine_choice=final.engine_choice,
+                    certificate_state=final.engine.certificate_state,
+                    status=stored.status,
+                    reason=stored.reason,
+                    n=top_n,
+                    candidates=stored.items[:top_n],
+                    captured_utc=stored.fetched_utc,
+                    followed_from=record.ref_id if final.ref_id != record.ref_id else None,
+                )
+
+        if pace_s > 0:
+            await anyio.sleep(pace_s)
+        q = record.query
+        result, reason = await _review.fetch_with_429_retry(
+            self._m.client,
+            self._m.gate,
+            name=q.name,
+            category=q.entity_type,
+            identifiers=dict(q.identifiers),
+            annotation_mode=q.annotation_mode,
+            n=top_n,
+            timeout_s=cfg.bridge_timeout_s,
+            backoff_s=cfg.systemic_backoff_s,
+        )
+        fallback = record.pins.kg_build
+        if record.source == "job" and record.job_id:
+            fallback = self._harmonize_job(record.job_id).kg_build
+        build = await self._fresh_build(fallback)
+        out = _cands.finish_ref(
+            self._m.refs, _utc(cfg.wall_clock()), record, result, reason, top_n, build
+        )
+        if record.source == "job" and record.job_id:
+            job = self._harmonize_job(record.job_id)
+            if job.state in FINISHED_STATES:
+                counts = _review.EntryStore(cfg.home).refresh(
+                    job.job_id, record.ref_id, out.status, out.reason, out.superseding_ref
+                )
+                if counts is not None and counts != job.review:
+                    job.review = counts
+                    self._m._save(job)
+        return out
+
+    def record_suggestion(
+        self,
+        ref: str,
+        choice: str,
+        rationale: str,
+        *,
+        update_choices: bool = True,
+    ) -> SuggestionResult:
+        """Record an agent suggestion for one row or link ``ref`` via ``SuggestionStore``."""
+        store = self.suggestions
+        try:
+            ref_kind, job_id = parse_ref(ref)
+        except RefError as exc:
+            raise JobError(str(exc)) from None
+
+        def harmonize_rows(job: HarmonizeJob) -> list[list[Any]]:
+            index = _review.EntryStore(self._config.home).load(job.job_id)
+            links = [e.ref for e in index.entries if e.kind == "link"] if index else []
+            return [*store.job_rows(job.job_id), *store.link_rows(links)]
+
+        if ref_kind == "link":
+            assert job_id is not None
+            job = self._finished(job_id, "suggestions are")
+            index = self._index(job_id)
+            entry = index.find(ref)
+            if entry is None or entry.kind != "link":
+                raise JobError(f"No review item {ref!r} in job {job_id}.")
+            try:
+                answer = _judgments.validate_link_choice(choice)
+            except JudgmentError as exc:
+                raise JobError(str(exc)) from None
+            if update_choices:
+                self._m.check_choices_writable(job)
+            made = store.record_link(
+                ref,
+                job.job_id,
+                answer,
+                rationale,
+                nodes=[s.node for s in entry.sides],
+                labels=[s.rows[0].name if s.rows else "" for s in entry.sides],
+                reasons=entry.review_reasons or entry.bases,
+            )
+            written: str | None = None
+            if update_choices:
+                written = str(self._m.write_choices(job, harmonize_rows(job)))
+            return SuggestionResult(
+                suggestion_id=made.suggestion_id,
+                ref=ref,
+                choice=made.choice,
+                choice_source="link",
+                supersedes=made.supersedes,
+                recorded_utc=made.recorded_utc,
+                choices_path=written,
+            )
+
+        record = self.load_ref(ref)
+        try:
+            canonical, source, backing = _judgments.validate_choice(record, choice)
+        except JudgmentError as exc:
+            raise JobError(str(exc)) from None
+        job_obj: HarmonizeJob | None = None
+        if record.source == "job":
+            job_obj = self._finished(record.job_id or "", "suggestions are")
+            if update_choices:
+                self._m.check_choices_writable(job_obj)
+        suggestion = store.record(record, canonical, source, rationale, backing)
+        choices_path: str | None = None
+        if job_obj is not None and update_choices:
+            choices_path = str(self._m.write_choices(job_obj, harmonize_rows(job_obj)))
+        return SuggestionResult(
+            suggestion_id=suggestion.suggestion_id,
+            ref=record.ref_id,
+            choice=suggestion.choice,
+            choice_source=suggestion.choice_source,
+            supersedes=suggestion.supersedes,
+            recorded_utc=suggestion.recorded_utc,
+            choices_path=choices_path,
+        )
