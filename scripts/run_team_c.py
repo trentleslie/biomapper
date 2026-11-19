@@ -16,6 +16,7 @@ import asyncio
 import csv
 import hashlib
 import json
+import logging
 import os
 import shutil
 import stat
@@ -23,7 +24,7 @@ import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import anyio
 
@@ -36,14 +37,16 @@ from biomapper.extras.protein_review import (
 from biomapper.extras.protein_review import (
     decide_review as decide_protein_review,
 )
-from biomapper.jobs import CohortSpec, HarmonizeJobs
+from biomapper.jobs import CohortSpec, HarmonizeJobs, JobError
 from biomapper.mcp.candidates import RefCandidates
 from biomapper.mcp.judgments import (
     CHOICES_MARKER,
     write_choices,
 )
-from biomapper.mcp.references import RefRecord
+from biomapper.mcp.references import CandidateItem, RefRecord
 from biomapper.models import MappingResult
+
+logger = logging.getLogger(__name__)
 
 HARMONIZE_ROOT = Path("/home/trentleslie/agy-team-competition/harmonize")
 WORKTREE_DIR = HARMONIZE_ROOT / "worktrees" / "team-c"
@@ -205,6 +208,142 @@ def verify_choices_alignment(
         changed = [k for k in set(pre_hashes) | set(post_hashes) if pre_hashes.get(k) != post_hashes.get(k)]
         raise RuntimeError(f"Report/TSV files modified during review: {changed}")
     return counts
+
+
+_MISSING_ENGINE_TRIGGERS = frozenset({"unresolved", "refused", "no_node"})
+
+
+class _ResolvedReviewTarget(NamedTuple):
+    ref_id: str
+    weak_trigger: str | None
+    engine_choice: str | None
+    kg_equivalent_ids: Mapping[str, Sequence[str]]
+    candidates: Sequence[CandidateItem]
+    confidence_score: float | None
+
+
+def _resolve_review_target(
+    jobs: HarmonizeJobs,
+    cand_res: RefCandidates,
+    *,
+    fallback_weak_trigger: str | None,
+    fallback_eq_ids: Mapping[str, Sequence[str]],
+    fallback_score: float | None,
+) -> _ResolvedReviewTarget:
+    """Resolve the active recordable ref and consistent engine/candidate context.
+
+    On ``run_mismatch``, ``fetch_candidates`` keeps ``cand_res.ref`` pointing at the stale ref
+    and places the newly anchored ref in ``cand_res.superseding_ref``. Recording suggestions must
+    target ``superseding_ref`` using the replacement ref's engine state and usable candidate set;
+    when no usable candidate set exists (e.g. ``none_searched``, ``fetch_failed``, ``not_captured``,
+    or ``run_mismatch`` without a replacement ref), candidates are omitted so review safely falls
+    back to keeping the engine choice or ``"none"``.
+    """
+    if cand_res.status == "run_mismatch":
+        if cand_res.superseding_ref:
+            try:
+                rec = jobs.load_ref(cand_res.superseding_ref)
+            except JobError as exc:
+                logger.warning(
+                    "Could not load superseding ref %s for %s: %s",
+                    cand_res.superseding_ref,
+                    cand_res.ref,
+                    exc,
+                )
+            else:
+                stored = rec.candidates
+                usable_items: Sequence[CandidateItem] = (
+                    list(cand_res.candidates or stored.items)
+                    if stored is not None and stored.usable and (cand_res.candidates or stored.items)
+                    else ()
+                )
+                trig = rec.weak_trigger
+                if trig is None and fallback_weak_trigger not in _MISSING_ENGINE_TRIGGERS:
+                    trig = fallback_weak_trigger
+                eq_ids: Mapping[str, Sequence[str]] = rec.engine.kg_equivalent_ids or (
+                    fallback_eq_ids if rec.engine_choice == cand_res.engine_choice else {}
+                )
+                score = fallback_score if rec.engine_choice == cand_res.engine_choice else None
+                return _ResolvedReviewTarget(
+                    ref_id=rec.ref_id,
+                    weak_trigger=trig,
+                    engine_choice=rec.engine_choice,
+                    kg_equivalent_ids=eq_ids,
+                    candidates=usable_items,
+                    confidence_score=score,
+                )
+        return _ResolvedReviewTarget(
+            ref_id=cand_res.ref,
+            weak_trigger=cand_res.weak_trigger or fallback_weak_trigger,
+            engine_choice=cand_res.engine_choice,
+            kg_equivalent_ids=fallback_eq_ids,
+            candidates=(),
+            confidence_score=fallback_score,
+        )
+
+    usable = cand_res.status == "present" and bool(cand_res.candidates)
+    engine_choice = cand_res.engine_choice
+    try:
+        rec = jobs.load_ref(cand_res.ref)
+    except JobError:
+        rec = None
+    if rec is not None:
+        engine_choice = rec.engine_choice
+        if rec.candidates is None or not rec.candidates.usable:
+            usable = False
+    return _ResolvedReviewTarget(
+        ref_id=cand_res.ref,
+        weak_trigger=fallback_weak_trigger or cand_res.weak_trigger,
+        engine_choice=engine_choice,
+        kg_equivalent_ids=fallback_eq_ids,
+        candidates=list(cand_res.candidates) if usable else (),
+        confidence_score=fallback_score,
+    )
+
+
+def _record_review_suggestion(
+    jobs: HarmonizeJobs,
+    target_ref: str,
+    *,
+    decision_choice: str,
+    decision_rationale: str,
+    engine_choice: str | None,
+) -> bool:
+    """Record a suggestion on ``target_ref``, falling back cleanly on un-recordable refs."""
+    try:
+        jobs.record_suggestion(
+            target_ref,
+            decision_choice,
+            decision_rationale,
+            update_choices=False,
+        )
+        return True
+    except JobError as exc:
+        logger.warning(
+            "record_suggestion refused (%s) for ref=%s choice=%s: %s",
+            type(exc).__name__,
+            target_ref,
+            decision_choice,
+            exc,
+        )
+        fallback_choice = (engine_choice or "").strip() or "none"
+        if decision_choice != fallback_choice:
+            try:
+                jobs.record_suggestion(
+                    target_ref,
+                    fallback_choice,
+                    f"Fallback ({fallback_choice}) after candidate record error: {decision_rationale}"[:500],
+                    update_choices=False,
+                )
+                return True
+            except JobError as exc2:
+                logger.warning(
+                    "Fallback record_suggestion refused for ref=%s choice=%s: %s",
+                    target_ref,
+                    fallback_choice,
+                    exc2,
+                )
+        return False
 
 
 async def run_dataset_b_team_c(
@@ -381,27 +520,35 @@ async def run_dataset_b_team_c(
             )
             if needs_live_fetch:
                 fetched_extra += 1
-            active_ref = cand_res.ref
-            target, full_name = targets_by_seqid.get(first_seqid, ("", detail.row.name))
             score_raw = rrow.get("confidence_score")
             conf_score = float(score_raw) if isinstance(score_raw, int | float) else None
+            resolved_target = _resolve_review_target(
+                jobs,
+                cand_res,
+                fallback_weak_trigger=cand_res.weak_trigger,
+                fallback_eq_ids=rrow.get("kg_equivalent_ids") or {},
+                fallback_score=conf_score,
+            )
+            active_ref = resolved_target.ref_id
+            target, full_name = targets_by_seqid.get(first_seqid, ("", detail.row.name))
             decision = decide_protein_review(
                 target=target,
                 target_full_name=full_name,
-                weak_trigger=cand_res.weak_trigger,
-                engine_choice=cand_res.engine_choice,
-                kg_equivalent_ids=rrow.get("kg_equivalent_ids") or {},
-                candidates=cand_res.candidates,
-                confidence_score=conf_score,
+                weak_trigger=resolved_target.weak_trigger,
+                engine_choice=resolved_target.engine_choice,
+                kg_equivalent_ids=resolved_target.kg_equivalent_ids,
+                candidates=resolved_target.candidates,
+                confidence_score=resolved_target.confidence_score,
             )
-            jobs.record_suggestion(
+            if _record_review_suggestion(
+                jobs,
                 active_ref,
-                decision.choice,
-                decision.rationale,
-                update_choices=False,
-            )
-            for seq_id in twinsuk_seqids:
-                reviewed_seqid_refs.append((seq_id, active_ref))
+                decision_choice=decision.choice,
+                decision_rationale=decision.rationale,
+                engine_choice=resolved_target.engine_choice,
+            ):
+                for seq_id in twinsuk_seqids:
+                    reviewed_seqid_refs.append((seq_id, active_ref))
 
         # Stage 2: review additional resolved suspect rows (collisions, non-HGNC, medium score).
         suspects = find_suspect_twinsuk_rows(
@@ -412,6 +559,7 @@ async def run_dataset_b_team_c(
         )
         suspect_cache: dict[str, tuple[RefRecord, RefCandidates]] = {}
         recorded_refs: set[str] = set()
+        failed_refs: set[str] = set()
         for suspect in suspects:
             rrow = row_by_seqid[suspect.seq_id]
             cached = suspect_cache.get(suspect.query_name)
@@ -434,25 +582,36 @@ async def run_dataset_b_team_c(
                 suspect_cache[suspect.query_name] = (rec, cand_res)
             else:
                 _, cand_res = cached
-            active_ref = cand_res.ref
-            if active_ref not in recorded_refs:
+            resolved_target = _resolve_review_target(
+                jobs,
+                cand_res,
+                fallback_weak_trigger=suspect.trigger,
+                fallback_eq_ids=rrow.get("kg_equivalent_ids") or {},
+                fallback_score=suspect.confidence_score,
+            )
+            active_ref = resolved_target.ref_id
+            if active_ref not in recorded_refs and active_ref not in failed_refs:
                 decision = decide_protein_review(
                     target=suspect.target,
                     target_full_name=suspect.target_full_name,
-                    weak_trigger=suspect.trigger,
-                    engine_choice=cand_res.engine_choice,
-                    kg_equivalent_ids=rrow.get("kg_equivalent_ids") or {},
-                    candidates=cand_res.candidates,
-                    confidence_score=suspect.confidence_score,
+                    weak_trigger=resolved_target.weak_trigger,
+                    engine_choice=resolved_target.engine_choice,
+                    kg_equivalent_ids=resolved_target.kg_equivalent_ids,
+                    candidates=resolved_target.candidates,
+                    confidence_score=resolved_target.confidence_score,
                 )
-                jobs.record_suggestion(
+                if _record_review_suggestion(
+                    jobs,
                     active_ref,
-                    decision.choice,
-                    decision.rationale,
-                    update_choices=False,
-                )
-                recorded_refs.add(active_ref)
-            reviewed_seqid_refs.append((suspect.seq_id, active_ref))
+                    decision_choice=decision.choice,
+                    decision_rationale=decision.rationale,
+                    engine_choice=resolved_target.engine_choice,
+                ):
+                    recorded_refs.add(active_ref)
+                else:
+                    failed_refs.add(active_ref)
+            if active_ref in recorded_refs:
+                reviewed_seqid_refs.append((suspect.seq_id, active_ref))
 
         choice_rows = jobs.suggestions.cohort_choice_rows(reviewed_seqid_refs)
         choices_path = active_subrun_dir / "choices.tsv"

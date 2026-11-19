@@ -531,3 +531,279 @@ def test_prepare_input_files_slice_and_hygiene_patterns(tmp_path: Path) -> None:
         text = path.read_text(encoding="utf-8")
         for tok in val_mod.FORBIDDEN_CODE_PATTERNS:
             assert tok not in text, f"forbidden token {tok!r} in {path}"
+
+
+@pytest.mark.asyncio
+async def test_run_team_c_handles_run_mismatch_replacement_refs_in_stage1_and_stage2(
+    tmp_path: Path,
+) -> None:
+    runner_mod = _load_module("run_team_c_mismatch_mod", WORKTREE_DIR / "scripts" / "run_team_c.py")
+    val_mod = _load_module("validate_run_mismatch_mod", HARMONIZE_ROOT / "shared" / "validate_run.py")
+
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    for fname in ("ukbb_proteins.tsv", "arivale_proteins.tsv"):
+        (inputs / fname).write_text("key\tname\tUniProtKB\nu1\tSPARC\tP09486\n", encoding="utf-8")
+
+    # Stage 1 target: "Weak_Capture_Fail_Prot" (low score 1.6 -> captured fails, Stage 1 live re-maps with choice_changed).
+    # Stage 2 targets (duplicate TargetFullName): "Tissue Factor" (medium score 2.6 -> Stage 2 live re-maps with choice_changed).
+    (inputs / "twinsuk_somascan_targets.tsv").write_text(
+        "SeqId\tTarget\tTargetFullName\n"
+        "1001-1\tIL-11 RA\tInterleukin-11 receptor subunit alpha\n"
+        "2001-1\tTF\tTissue Factor\n"
+        "2001-2\tTF\tTissue Factor\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "mismatch_run"
+    store_dir = tmp_path / "mismatch_store"
+    call_counts: dict[tuple[str, bool], int] = {}
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{API}/health").mock(
+            return_value=httpx.Response(200, json={"status": "healthy", "version": "0.1.0"})
+        )
+        router.get(f"{KESTREL}/health").mock(
+            return_value=httpx.Response(200, json={"kestrel_version": "0.5.0", "kg_build": KG_BUILD})
+        )
+
+        async def mock_batch(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            out_rows = []
+            for ent in body["entities"]:
+                name = ent["name"]
+                top_n = (ent.get("options") or {}).get("kestrel_top_n")
+                key = (name, bool(top_n))
+                call_counts[key] = call_counts.get(key, 0) + 1
+                n_calls = call_counts[key]
+
+                if name == "Interleukin-11 receptor subunit alpha":
+                    if not top_n:
+                        # Initial harmonize: low score -> weak_trigger="low_confidence".
+                        out_rows.append(
+                            {
+                                "name": name,
+                                "curies": ["HGNC:5966"],
+                                "chosen_kg_id": "HGNC:5966",
+                                "primary_curie": "HGNC:5966",
+                                "kg_equivalent_ids": {"HGNC": ["5966"]},
+                                "assigned_ids": {"kestrel-hybrid-search": {"HGNC": {"5966": {"score": 1.6}}}},
+                                "resolution_certificate": {"state": "not_applicable"},
+                                "kestrel_results": None,
+                                "error": None,
+                            }
+                        )
+                    elif n_calls == 1:
+                        # Capture-time fetch fails transiently -> candidates_status="fetch_failed".
+                        out_rows.append({"name": name, "curies": [], "error": "transient HTTP 503"})
+                    else:
+                        # Stage 1 live re-map changes choice (choice_changed) and returns IL11RA candidate.
+                        out_rows.append(
+                            {
+                                "name": name,
+                                "curies": ["HGNC:9999"],
+                                "chosen_kg_id": "HGNC:9999",
+                                "primary_curie": "HGNC:9999",
+                                "kg_equivalent_ids": {"HGNC": ["9999"]},
+                                "assigned_ids": {"kestrel-hybrid-search": {"HGNC": {"9999": {"score": 1.7}}}},
+                                "resolution_certificate": {"state": "not_applicable"},
+                                "kestrel_results": [
+                                    kestrel_block(
+                                        "hybrid-search",
+                                        [
+                                            kestrel_row("HGNC:9999", 1.7, "IL11", synonyms=["Interleukin-11"]),
+                                            kestrel_row(
+                                                "HGNC:5967",
+                                                3.8,
+                                                "IL11RA",
+                                                synonyms=["Interleukin-11 receptor subunit alpha"],
+                                            ),
+                                        ],
+                                    )
+                                ],
+                                "error": None,
+                            }
+                        )
+                elif name == "Tissue Factor":
+                    if not top_n:
+                        # Initial harmonize: medium score 2.6 -> Stage 2 suspect ("medium_confidence").
+                        out_rows.append(
+                            {
+                                "name": name,
+                                "curies": ["HGNC:11740"],
+                                "chosen_kg_id": "HGNC:11740",
+                                "primary_curie": "HGNC:11740",
+                                "kg_equivalent_ids": {"HGNC": ["11740"]},
+                                "assigned_ids": {"kestrel-hybrid-search": {"HGNC": {"11740": {"score": 2.6}}}},
+                                "resolution_certificate": {"state": "not_applicable"},
+                                "kestrel_results": None,
+                                "error": None,
+                            }
+                        )
+                    else:
+                        # Stage 2 live re-map changes chosen_kg_id (choice_changed) and supplies F3.
+                        out_rows.append(
+                            {
+                                "name": name,
+                                "curies": ["HGNC:11741"],
+                                "chosen_kg_id": "HGNC:11741",
+                                "primary_curie": "HGNC:11741",
+                                "kg_equivalent_ids": {"HGNC": ["11741"]},
+                                "assigned_ids": {"kestrel-hybrid-search": {"HGNC": {"11741": {"score": 2.8}}}},
+                                "resolution_certificate": {"state": "not_applicable"},
+                                "kestrel_results": [
+                                    kestrel_block(
+                                        "hybrid-search",
+                                        [
+                                            kestrel_row("HGNC:11741", 2.8, "TF", synonyms=["Transferrin"]),
+                                            kestrel_row(
+                                                "HGNC:3541",
+                                                4.2,
+                                                "F3",
+                                                synonyms=["Tissue Factor", "Coagulation factor III"],
+                                            ),
+                                        ],
+                                    )
+                                ],
+                                "error": None,
+                            }
+                        )
+                else:
+                    out_rows.append(_build_mock_protein_entry(name, top_n=top_n, idx=1))
+            return httpx.Response(200, json=batch_response(out_rows))
+
+        router.post(f"{API}/map/batch").mock(side_effect=mock_batch)
+
+        manifest = await runner_mod.run_dataset_b_team_c(
+            output_dir=output_dir,
+            store_dir=store_dir,
+            pilot=False,
+            inputs_dir=inputs,
+            seed_store_dir=tmp_path / "none",
+            worktree_dir=WORKTREE_DIR,
+            base_url=API,
+            kestrel_url=KESTREL,
+            pace_s=0.0,
+            poll_s=0.02,
+            resume_wait_s=0.01,
+            systemic_backoff_s=0.0,
+            chunk_size=10,
+            capture_max_entities=500,
+            capture_top_n=25,
+        )
+
+    subrun = output_dir / "dataset_b_proteins"
+    lines = (subrun / "choices.tsv").read_text(encoding="utf-8").splitlines()
+    parsed = {
+        r["key"]: r
+        for r in csv.DictReader([ln for ln in lines if not ln.startswith("#")], delimiter="\t")
+    }
+    assert parsed["1001-1"]["suggested_choice"] == "HGNC:5967"
+    assert parsed["1001-1"]["choice_source"] == "candidate"
+    assert parsed["2001-1"]["suggested_choice"] == "HGNC:3541"
+    assert parsed["2001-1"]["choice_source"] == "candidate"
+    assert parsed["2001-2"]["suggested_choice"] == "HGNC:3541"
+    assert parsed["2001-2"]["ref"] == parsed["2001-1"]["ref"]
+    assert (output_dir / "run_manifest.json").is_file()
+    assert (output_dir / "rerun.sh").is_file()
+    assert manifest["subruns"]["dataset_b_proteins"]["choices_summary"]["candidate"] == 3
+    cov_info, cov_errs = val_mod.compute_subrun_coverage(
+        "dataset_b_proteins",
+        subrun,
+        expected_twinsuk_seqids={"1001-1", "2001-1", "2001-2"},
+        use_overlay=True,
+    )
+    assert cov_errs == []
+    assert cov_info["cohorts"]["twinsuk"]["grouped"] == 3
+
+
+def test_resolve_and_record_review_target_unrecordable_fallbacks(tmp_path: Path) -> None:
+    from biomapper.jobs import HarmonizeJobs
+    from biomapper.mcp.candidates import RefCandidates
+    from biomapper.mcp.references import CandidateSet, RefEngine, RefPins, RefQuery, RefRecord
+
+    runner_mod = _load_module("run_team_c_fallback_mod", WORKTREE_DIR / "scripts" / "run_team_c.py")
+
+    # 1. run_mismatch with no superseding_ref drops stale candidate list -> engine/none fallback.
+    cand_no_super = RefCandidates(
+        ref="jref-old",
+        query_name="P1",
+        weak_trigger="medium_confidence",
+        engine_choice="HGNC:10",
+        certificate_state="not_applicable",
+        status="run_mismatch",
+        reason="choice_changed",
+        n=25,
+        candidates=[_cand("HGNC:99", "OTHER", 4.0)],
+        superseding_ref=None,
+    )
+
+    class _FakeJobs:
+        def __init__(self, refs: dict[str, RefRecord], refuse_refs: set[str] | None = None) -> None:
+            self._refs = refs
+            self._refuse = refuse_refs or set()
+            self.recorded: list[tuple[str, str]] = []
+
+        def load_ref(self, ref_id: str) -> RefRecord:
+            if ref_id not in self._refs:
+                raise runner_mod.JobError(f"missing {ref_id}")
+            return self._refs[ref_id]
+
+        def record_suggestion(
+            self, ref_id: str, choice: str, rationale: str, *, update_choices: bool = True
+        ) -> None:
+            if ref_id in self._refuse:
+                raise runner_mod.JobError(f"refused {ref_id}")
+            if choice == "HGNC:99":
+                raise runner_mod.JobError("candidate unusable")
+            self.recorded.append((ref_id, choice))
+
+    old_rec = RefRecord(
+        ref_id="jref-old",
+        source="job",
+        job_id="a" * 16,
+        row_key="1-1",
+        created_utc="2026-01-01T00:00:00Z",
+        created_ts=1.0,
+        query=RefQuery(name="P1", entity_type="biolink:Protein"),
+        engine=RefEngine(status="ok", chosen_kg_id="HGNC:10", primary_curie="HGNC:10"),
+        weak_trigger="medium_confidence",
+        pins=RefPins(kg_build="2.3.0 (3dd08a5b)"),
+        candidates=CandidateSet(status="run_mismatch", reason="choice_changed", n=25, fetched_utc="2026-01-01T00:00:00Z"),
+    )
+    fake_jobs: HarmonizeJobs = _FakeJobs({"jref-old": old_rec})  # type: ignore[assignment]
+    resolved = runner_mod._resolve_review_target(
+        fake_jobs,
+        cand_no_super,
+        fallback_weak_trigger="medium_confidence",
+        fallback_eq_ids={"HGNC": ["10"]},
+        fallback_score=2.5,
+    )
+    assert resolved.ref_id == "jref-old"
+    assert list(resolved.candidates) == []
+    assert resolved.engine_choice == "HGNC:10"
+
+    # 2. _record_review_suggestion falls back to engine_choice if candidate fails, and returns False if ref is refused.
+    assert (
+        runner_mod._record_review_suggestion(
+            fake_jobs,
+            "jref-old",
+            decision_choice="HGNC:99",
+            decision_rationale="candidate choice",
+            engine_choice="HGNC:10",
+        )
+        is True
+    )
+    assert fake_jobs.recorded == [("jref-old", "HGNC:10")]  # type: ignore[attr-defined]
+
+    refused_jobs: HarmonizeJobs = _FakeJobs({}, refuse_refs={"jref-bad"})  # type: ignore[assignment]
+    assert (
+        runner_mod._record_review_suggestion(
+            refused_jobs,
+            "jref-bad",
+            decision_choice="HGNC:99",
+            decision_rationale="bad ref",
+            engine_choice="HGNC:10",
+        )
+        is False
+    )
