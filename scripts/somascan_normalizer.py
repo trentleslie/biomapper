@@ -549,6 +549,14 @@ _NAMED_COMPLEX_SUBUNITS: dict[str, tuple[str, ...]] = {
         "Laminin subunit beta-1",
         "Laminin subunit gamma-1",
     ),
+    "complement c4": (
+        "Complement C4-A",
+        "Complement C4-B",
+    ),
+    "complement c4b": (
+        "Complement C4-A",
+        "Complement C4-B",
+    ),
 }
 
 # Explicit multi-paralog cross-reactive SomaScan targets (slash-separated genes).
@@ -584,7 +592,6 @@ _CLEAVAGE_FRAGMENT_TO_PARENT: dict[str, str] = {
     "complement c3b": "Complement C3",
     "complement c3b, inactivated": "Complement C3",
     "complement c3d fragment": "Complement C3",
-    "complement c4b": "Complement C4",
     "c5a anaphylatoxin": "Complement C5",
     "coagulation factor ixab": "Coagulation factor IX",
     "coagulation factor xa": "Coagulation factor X",
@@ -803,6 +810,8 @@ _NOMENCLATURE_ALIASES: dict[str, str] = {
     "complement c1q subcomponent subunit c": "C1QC",
     "complement c1r subcomponent": "C1R",
     "complement c1s subcomponent": "C1S",
+    "complement c4-a": "C4A",
+    "complement c4-b": "C4B",
     "complement component 1 q subcomponent-binding protein, mitochondrial": "C1QBP",
     "complement component c1q receptor": "CD93",
     "complement component c8 alpha chain": "C8A",
@@ -849,6 +858,7 @@ _NOMENCLATURE_ALIASES: dict[str, str] = {
     "cytosolic non-specific dipeptidase": "CNDP2",
     "cytotoxic and regulatory t-cell molecule": "CRTAM",
     "cytotoxic t-lymphocyte protein 4": "CTLA4",
+    "d-dimer": "Fibrin D-dimer",
     "dctp pyrophosphatase 1": "DCTPP1",
     "death-associated protein kinase 2": "DAPK2",
     "decorin": "DCN",
@@ -980,7 +990,6 @@ _NOMENCLATURE_ALIASES: dict[str, str] = {
     "heat shock protein hsp 90-beta": "HSP90AB1",
     "heme oxygenase 2": "HMOX2",
     "hemk methyltransferase family member 2": "N6AMT1",
-    "hemoglobin subunit alpha-1": "HBA1",
     "hemoglobin subunit beta": "HBB",
     "hemojuvelin": "HJV",
     "hemopexin": "HPX",
@@ -1297,6 +1306,8 @@ _NOMENCLATURE_ALIASES: dict[str, str] = {
     "platelet-derived growth factor subunit b": "PDGFB",
     "pleiotrophin": "PTN",
     "polymeric immunoglobulin receptor": "PIGR",
+    "polyubiquitin k48-linked": "UBC",
+    "polyubiquitin k63-linked": "UBC",
     "prefoldin subunit 5": "PFDN5",
     "pro-opiomelanocortin": "POMC",
     "programmed cell death 1 ligand 1": "CD274",
@@ -1615,7 +1626,7 @@ _FAMILY_REGEX_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^contactin-(\d+)$", re.I), r"CNTN\1"),
     (re.compile(r"^desmoglein-(\d+)$", re.I), r"DSG\1"),
     (re.compile(r"^desmocollin-(\d+)$", re.I), r"DSC\1"),
-    (re.compile(r"^galectin-([234789])$", re.I), r"LGALS\1"),
+    (re.compile(r"^galectin-([23489])$", re.I), r"LGALS\1"),
     (re.compile(r"^glypican-(\d+)$", re.I), r"GPC\1"),
     (re.compile(r"^kallikrein-(\d+)$", re.I), r"KLK\1"),
     (re.compile(r"^matrilin-(\d+)$", re.I), r"MATN\1"),
@@ -1812,7 +1823,6 @@ def _clean_surface_text(text: str) -> str:
     s = re.sub(r"\s+g-chain dimer$", " gamma chain", s)
     s = re.sub(r"^Alpha-1-antichymotrypsin complex$", "Alpha-1-antichymotrypsin", s)
     s = re.sub(r"^Ck-beta-8-1$", "C-C motif chemokine 23", s, flags=re.I)
-    s = re.sub(r"^PolyUbiquitin K(?:48|63)-linked$", "Ubiquitin", s, flags=re.I)
 
     low = s.casefold()
     if low in _CLEAVAGE_FRAGMENT_TO_PARENT:
@@ -1882,9 +1892,6 @@ def _apply_family_rules(cleaned: str) -> str | None:
         num = _ROMAN_TO_INT.get(m_coag.group(1).upper())
         if num is not None:
             return f"F{num}"
-
-    if low == "complement c4":
-        return "Complement C4"
 
     for pat, repl in _FAMILY_REGEX_RULES:
         m = pat.fullmatch(cleaned)

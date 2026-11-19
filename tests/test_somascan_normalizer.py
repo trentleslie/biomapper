@@ -29,7 +29,7 @@ if str(SHARED_DIR) not in sys.path:
 
 from biomapper._provenance import DEFAULT_KESTREL_URL  # noqa: E402
 from biomapper.client import DEFAULT_BASE_URL  # noqa: E402
-from run_dataset_b import run_dataset_b  # noqa: E402
+from run_dataset_b import _has_store_cache, run_dataset_b  # noqa: E402
 from somascan_normalizer import (  # noqa: E402
     normalize_somascan_row,
     normalize_somascan_table,
@@ -231,8 +231,10 @@ def _mount_mock_api(
         ("5934-1", "Ferritin", "Ferritin", ["FTH1", "FTL"]),
         ("4903-72", "Calcineurin", "Calcineurin", ["PPP3CA", "PPP3R1"]),
         ("2668-70", "Calpain I", "Calpain I", ["CAPN1", "CAPNS1"]),
-        ("4915-64", "Hemoglobin", "Hemoglobin", ["HBA1", "HBB"]),
+        ("4915-64", "Hemoglobin", "Hemoglobin", ["Hemoglobin subunit alpha-1", "HBB"]),
         ("2728-62", "Laminin", "Laminin", ["LAMA1", "LAMB1", "LAMC1"]),
+        ("4481-34", "C4", "Complement C4", ["C4A", "C4B"]),
+        ("2182-54", "C4b", "Complement C4b", ["C4A", "C4B"]),
     ],
 )
 def test_split_complex_components(
@@ -286,7 +288,7 @@ def test_split_complex_components(
         ),
         ("4179-57", "14-3-3", "14-3-3 protein family", "14-3-3 protein family"),
         ("11089-7", "IgA", "Immunoglobulin A", "Immunoglobulin A"),
-        ("4907-56", "D-dimer", "D-dimer", "D-dimer"),
+        ("4907-56", "D-dimer", "D-dimer", "Fibrin D-dimer"),
     ],
 )
 def test_single_protein_slash_and_family_guards_not_split(
@@ -370,6 +372,11 @@ def test_single_protein_slash_and_family_guards_not_split(
         ("3388-58", "PAK7", "Serine/threonine-protein kinase PAK 7", "PAK5"),
         ("3347-9", "BARK1", "beta-adrenergic receptor kinase 1", "GRK2"),
         ("11096-57", "HEMK2", "HemK methyltransferase family member 2", "N6AMT1"),
+        ("6641-60", "PolyUbiquitin K48", "PolyUbiquitin K48-linked", "UBC"),
+        ("6647-55", "PolyUbiquitin K63", "PolyUbiquitin K63-linked", "UBC"),
+        ("4474-19", "Ubiquitin", "Ubiquitin", "Ubiquitin"),
+        ("9196-8", "Galectin-7", "Galectin-7", "Galectin-7"),
+        ("3827-22", "PAK6", "Serine/threonine-protein kinase PAK 6", "PAK6"),
         ("9999-1", "NovelTarget", "Novel protein, soluble form", "Novel protein"),
         ("9999-2", "NOVEL1", "Unseen hypothetical factor (isoform B)", "NOVEL1"),
     ],
@@ -397,8 +404,8 @@ def test_full_1364_twinsuk_normalization_and_seqid_components(tmp_path: Path) ->
     )
 
     assert stats["n_input_seqids"] == 1364
-    assert stats["n_split_seqids"] == 45
-    assert stats["n_single_seqids"] == 1319
+    assert stats["n_split_seqids"] == 47
+    assert stats["n_single_seqids"] == 1317
     assert stats["n_total_components"] > 1364
 
     with TWINSUK_TSV.open(newline="", encoding="utf-8") as fh:
@@ -455,9 +462,15 @@ def test_runner_pilot_offline_end_to_end(tmp_path: Path) -> None:
         )
 
     assert manifest["schema_version"] == 1
+    assert manifest["team"] == "team-a"
+    assert manifest["hardened_from_git_sha"] == "afd6436b0624fedf89d8ce539e901a4a8a6a2076"
     assert manifest["config"]["chunk_size"] == 10
     assert manifest["config"]["capture_max_entities"] == 0
     assert manifest["subruns"]["dataset_b_proteins"]["n_errored"] == 0
+    assert (
+        manifest["subruns"]["dataset_b_proteins"]["grade"]
+        == "iteration-grade, not for publication"
+    )
     assert all(sz <= 10 for sz in mock_state["batch_sizes"])
 
     rerun_path = out_dir / "rerun.sh"
@@ -581,7 +594,7 @@ def test_runner_resumes_stalled_and_retries_partial_until_zero_errors(tmp_path: 
                 output_dir=out_dir,
                 store_dir=store_dir,
                 pilot=True,
-                remap_all=True,
+                remap_all=False,
                 base_url=api,
                 kestrel_url=kestrel,
                 systemic_backoff_s=0.0,
@@ -594,7 +607,8 @@ def test_runner_resumes_stalled_and_retries_partial_until_zero_errors(tmp_path: 
     assert subrun_meta["resumes"] >= 1
     assert subrun_meta["attempts"] >= 2
     assert subrun_meta["n_errored"] == 0
-    assert manifest["config"]["remap_all"] is True
+    assert subrun_meta["grade"] == "iteration-grade, not for publication"
+    assert manifest["config"]["remap_all"] is False
     assert manifest["config"]["seed_store_copied"] is False
 
     val = validate_run_dir(out_dir, mode="dataset_b", pilot=True, worktree_dir=None)
@@ -645,7 +659,202 @@ def test_runner_slice_option(tmp_path: Path) -> None:
 
     assert manifest["config"]["slice_n"] == 10
     assert manifest["subruns"]["dataset_b_proteins"]["n_errored"] == 0
+    assert manifest["subruns"]["dataset_b_proteins"]["grade"] == "publishable"
     report = json.loads((out_dir / "dataset_b_proteins" / "report.json").read_text())
     assert report["mapping"]["names_only"]["ukbb"]["n_rows"] == 10
     assert report["mapping"]["names_only"]["arivale"]["n_rows"] == 10
     assert report["mapping"]["names_only"]["twinsuk"]["n_rows"] >= 10
+
+
+def test_runner_remap_all_restarts_clean_after_stall_and_partial_for_publishable_grade(
+    tmp_path: Path,
+) -> None:
+    api = "https://api.test/api/v1"
+    kestrel = "https://kestrel.test/api"
+    out_dir = tmp_path / "run_remap_clean"
+    store_dir = tmp_path / "store_remap_clean"
+
+    with respx.mock(assert_all_called=False) as router:
+        state = _mount_mock_api(
+            router,
+            base_url=api,
+            kestrel_url=kestrel,
+            kg_build=SEED_KG_BUILD,
+            fail_chunk_calls=3,
+        )
+
+        fail_budget = {"YWHAB": 4}
+        orig_handler = router.routes[-1].side_effect
+
+        def wrapped_batch(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            entities = body.get("entities", [])
+            if state["fail_chunk_calls"] > 0:
+                return orig_handler(request)
+            names = [e["name"] for e in entities]
+            if any(fail_budget.get(n, 0) > 0 for n in names):
+                results = []
+                for n in names:
+                    if fail_budget.get(n, 0) > 0:
+                        fail_budget[n] -= 1
+                        results.append(
+                            {
+                                "name": n,
+                                "curies": [],
+                                "chosen_kg_id": None,
+                                "kg_equivalent_ids": {},
+                                "assigned_ids": {},
+                                "error": "forced row failure",
+                            }
+                        )
+                    else:
+                        results.append(_fake_hgnc_entry(n, abs(hash(n)) % 90000 + 1000))
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": results,
+                        "metadata": {"request_id": "r", "processing_time_ms": 1.0},
+                    },
+                )
+            return orig_handler(request)
+
+        router.post(f"{api}/map/batch").mock(side_effect=wrapped_batch)
+
+        manifest = __import__("asyncio").run(
+            run_dataset_b(
+                output_dir=out_dir,
+                store_dir=store_dir,
+                pilot=True,
+                remap_all=True,
+                base_url=api,
+                kestrel_url=kestrel,
+                systemic_backoff_s=0.0,
+                poll_s=0.01,
+                seed_store_dir=None,
+            )
+        )
+
+    subrun_meta = manifest["subruns"]["dataset_b_proteins"]
+    assert subrun_meta["resumes"] == 0
+    assert subrun_meta["attempts"] >= 3
+    assert subrun_meta["n_errored"] == 0
+    assert subrun_meta["grade"] == "publishable"
+
+    report = json.loads((out_dir / "dataset_b_proteins" / "report.json").read_text())
+    assert report["grade"] == "publishable"
+    for prov in report["mapping"]["names_only"].values():
+        assert prov["n_reused"] == 0
+
+    val = validate_run_dir(out_dir, mode="dataset_b", pilot=True, worktree_dir=None)
+    assert val["pass"] is True, val["failures"]
+
+
+def test_runner_remap_all_requires_publishable_grade_and_raises_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import run_dataset_b as runner_mod
+
+    inputs_dir = tmp_path / "mini_inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "ukbb_proteins.tsv").write_text(
+        "key\tname\tUniProtKB\nUKBB1|P00001\tUKBB1\tP00001\n", encoding="utf-8"
+    )
+    (inputs_dir / "arivale_proteins.tsv").write_text(
+        "key\tname\tUniProtKB\nARI1|P00002\tARI1\tP00002\n", encoding="utf-8"
+    )
+    (inputs_dir / "twinsuk_somascan_targets.tsv").write_text(
+        "SeqId\tTarget\tTargetFullName\n1000-1\tGalectin-7\tGalectin-7\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner_mod, "SHARED_INPUTS_DIR", inputs_dir)
+
+    api = "https://api.test/api/v1"
+    kestrel = "https://kestrel.test/api"
+    with respx.mock(assert_all_called=False) as router:
+        _mount_mock_api(router, base_url=api, kestrel_url=kestrel, kg_build={})
+        with pytest.raises(RuntimeError, match="grade='publishable'"):
+            __import__("asyncio").run(
+                run_dataset_b(
+                    output_dir=tmp_path / "out_unverified",
+                    store_dir=tmp_path / "store_unverified",
+                    pilot=False,
+                    slice_n=None,
+                    remap_all=True,
+                    base_url=api,
+                    kestrel_url=kestrel,
+                    systemic_backoff_s=0.0,
+                    poll_s=0.01,
+                    seed_store_dir=None,
+                )
+            )
+
+
+def test_has_store_cache_detects_entity_cache_and_superseded(tmp_path: Path) -> None:
+    empty_store = tmp_path / "empty"
+    empty_store.mkdir()
+    assert _has_store_cache(empty_store) is False
+
+    cache_only = tmp_path / "cache_only"
+    leaf = cache_only / "names_only" / "proteins"
+    leaf.mkdir(parents=True)
+    (leaf / "entity_cache.jsonl").write_text("{}\n", encoding="utf-8")
+    assert _has_store_cache(cache_only) is True
+
+    superseded_only = tmp_path / "superseded_only"
+    leaf2 = superseded_only / "names_only" / "proteins"
+    leaf2.mkdir(parents=True)
+    (leaf2 / "entity_cache.jsonl.superseded-20261118T000000Z").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    assert _has_store_cache(superseded_only) is True
+
+
+def test_rerun_sh_portability_and_manifest_fallback(tmp_path: Path) -> None:
+    rerun_sh = WORKTREE_DIR / "rerun.sh"
+    rerun_text = rerun_sh.read_text(encoding="utf-8")
+    assert "worktrees/team-a" not in rerun_text
+    assert "--venv" not in rerun_text
+    assert "/home/trentleslie/agy-team-competition/harmonize/bin/bm-python" in rerun_text
+    assert str(WORKTREE_DIR / "scripts" / "run_dataset_b.py") in rerun_text
+
+    api = "https://api.test/api/v1"
+    kestrel = "https://kestrel.test/api"
+    out_dir = tmp_path / "run_portability"
+    store_dir = tmp_path / "store_portability"
+    with respx.mock(assert_all_called=False) as router:
+        _mount_mock_api(
+            router, base_url=api, kestrel_url=kestrel, kg_build=SEED_KG_BUILD
+        )
+        manifest = __import__("asyncio").run(
+            run_dataset_b(
+                output_dir=out_dir,
+                store_dir=store_dir,
+                pilot=True,
+                remap_all=True,
+                base_url=api,
+                kestrel_url=kestrel,
+                systemic_backoff_s=0.0,
+                poll_s=0.01,
+                seed_store_dir=None,
+                worktree_dir=WORKTREE_DIR,
+            )
+        )
+
+    assert manifest["team"] == "team-a"
+    assert manifest["hardened_from_git_sha"] == "afd6436b0624fedf89d8ce539e901a4a8a6a2076"
+    assert manifest["git_sha"] == "afd6436b0624fedf89d8ce539e901a4a8a6a2076"
+    assert manifest["branch"] == "winner"
+    assert manifest["subruns"]["dataset_b_proteins"]["grade"] == "publishable"
+    assert (out_dir / "rerun.sh").read_text(encoding="utf-8") == rerun_text
+
+
+def test_no_em_dashes_in_hardened_winner_files() -> None:
+    targets = [
+        WORKTREE_DIR / "rerun.sh",
+        WORKTREE_DIR / "scripts" / "run_dataset_b.py",
+        WORKTREE_DIR / "scripts" / "somascan_normalizer.py",
+        WORKTREE_DIR / "tests" / "test_somascan_normalizer.py",
+    ]
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        assert "\u2014" not in text, f"Found em dash in {path}"

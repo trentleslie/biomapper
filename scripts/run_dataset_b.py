@@ -35,6 +35,7 @@ HARMONIZE_ROOT = Path("/home/trentleslie/agy-team-competition/harmonize")
 SHARED_INPUTS_DIR = HARMONIZE_ROOT / "shared" / "inputs"
 SEED_STORE_DIR = HARMONIZE_ROOT / "shared" / "seed_store"
 WORKTREE_RERUN_SH = WORKTREE_DIR / "rerun.sh"
+HARDENED_FROM_GIT_SHA = "afd6436b0624fedf89d8ce539e901a4a8a6a2076"
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -90,6 +91,33 @@ def _count_report_errors(report: dict[str, Any]) -> int:
     return total
 
 
+def _count_report_reused(report: dict[str, Any]) -> int:
+    mapping = report.get("mapping") or {}
+    total = 0
+    for by_cohort in mapping.values():
+        if isinstance(by_cohort, dict):
+            for prov in by_cohort.values():
+                if isinstance(prov, dict):
+                    total += int(prov.get("n_reused") or 0)
+    return total
+
+
+def _has_store_cache(store_dir: Path) -> bool:
+    return any(store_dir.rglob("entity_cache.jsonl")) or any(
+        store_dir.rglob("*.superseded-*")
+    )
+
+
+def _wipe_partial_store_cache(store_dir: Path) -> None:
+    """Remove partial store cache/progress files before a clean --remap-all retry."""
+    if not store_dir.exists():
+        return
+    for pattern in ("entity_cache.jsonl", "progress.jsonl", "*.lock"):
+        for path in store_dir.rglob(pattern):
+            if path.is_file():
+                path.unlink()
+
+
 def _init_seed_store(
     store_dir: Path,
     *,
@@ -123,10 +151,14 @@ def _write_rerun_script(output_dir: Path) -> None:
         bm_python = HARMONIZE_ROOT / "bin" / "bm-python"
         venv_dir = WORKTREE_DIR / ".venv"
         runner = SCRIPT_DIR / "run_dataset_b.py"
+        if venv_dir.is_dir():
+            exec_line = f'exec "{bm_python}" --venv "{venv_dir}" "{runner}" "$@"\n'
+        else:
+            exec_line = f'exec "{bm_python}" "{runner}" "$@"\n'
         dst.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
-            f'exec "{bm_python}" --venv "{venv_dir}" "{runner}" "$@"\n',
+            + exec_line,
             encoding="utf-8",
         )
     os.chmod(dst, 0o755)
@@ -265,24 +297,27 @@ async def run_dataset_b(
     attempt_remap_all = remap_all
     report: dict[str, Any] = {}
 
-    async with HarmonizeJobs(
-        home=job_home,
-        roots=roots,
-        base_url=base_url,
-        api_key=api_key,
-        kestrel_url=kestrel_url,
-        on_progress=on_progress,
-        **limits,
-    ) as jobs:
-        while True:
-            attempts += 1
-            if attempts > max_attempts:
-                raise RuntimeError(
-                    f"Exceeded max_attempts={max_attempts} without achieving 0 errored rows"
-                )
-            if subrun_dir.exists():
-                _archive_dir(subrun_dir, attempts_archive, f"attempt_{attempts - 1}")
+    while True:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                f"Exceeded max_attempts={max_attempts} without achieving 0 errored rows"
+            )
+        if subrun_dir.exists():
+            _archive_dir(subrun_dir, attempts_archive, f"attempt_{attempts - 1}")
 
+        attempt_job_home = job_home / f"attempt_{attempts}"
+        attempt_job_home.mkdir(parents=True, exist_ok=True)
+
+        async with HarmonizeJobs(
+            home=attempt_job_home,
+            roots=roots,
+            base_url=base_url,
+            api_key=api_key,
+            kestrel_url=kestrel_url,
+            on_progress=on_progress,
+            **limits,
+        ) as jobs:
             status = await jobs.submit_many(
                 cohorts,
                 entity="proteins",
@@ -290,9 +325,21 @@ async def run_dataset_b(
                 store_dir=store_dir,
                 remap_all=attempt_remap_all,
             )
+            interrupted_for_clean_restart = False
             while True:
                 status = await jobs.wait(status.job_id, poll_s=poll_s)
                 if status.state in ("stalled", "paused", "expired", "cancelled"):
+                    if remap_all:
+                        print(
+                            f"[team-a] Attempt {attempts} interrupted ({status.state}: "
+                            f"{status.reason}); wiping partial store state for clean --remap-all restart.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        _wipe_partial_store_cache(store_dir)
+                        attempt_remap_all = True
+                        interrupted_for_clean_restart = True
+                        break
                     if resumes >= max_resumes:
                         raise RuntimeError(
                             f"Job {status.job_id} interrupted {resumes} times "
@@ -309,15 +356,19 @@ async def run_dataset_b(
                     continue
                 break
 
+            if interrupted_for_clean_restart:
+                continue
+
             if status.state == "failed":
                 print(
                     f"[team-a] Attempt {attempts} failed ({status.reason}); retrying.",
                     file=sys.stderr,
                     flush=True,
                 )
-                # Preserve remap_all only if no superseded backup was created yet.
-                has_superseded = any(store_dir.rglob("*.superseded-*"))
-                if has_superseded:
+                if remap_all:
+                    _wipe_partial_store_cache(store_dir)
+                    attempt_remap_all = True
+                elif _has_store_cache(store_dir):
                     attempt_remap_all = False
                 continue
 
@@ -328,6 +379,27 @@ async def run_dataset_b(
 
             report = jobs.load_report(status.job_id)
             n_errored = _count_report_errors(report)
+            n_reused = _count_report_reused(report)
+            if remap_all:
+                if (
+                    status.state == "complete"
+                    and n_errored == 0
+                    and report.get("status") == "ok"
+                    and resumes == 0
+                    and n_reused == 0
+                ):
+                    break
+                print(
+                    f"[team-a] Attempt {attempts} finished {status.state!r} "
+                    f"(n_errored={n_errored}, n_reused={n_reused}, resumes={resumes}); "
+                    "wiping partial store state for clean --remap-all restart.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _wipe_partial_store_cache(store_dir)
+                attempt_remap_all = True
+                continue
+
             if status.state == "complete" and n_errored == 0 and report.get("status") == "ok":
                 break
 
@@ -339,16 +411,42 @@ async def run_dataset_b(
             )
             attempt_remap_all = False
 
+    grade = report.get("grade")
+    final_reused = _count_report_reused(report)
+    if remap_all and (resumes > 0 or final_reused > 0):
+        raise RuntimeError(
+            f"--remap-all requires an uninterrupted pass with zero reused rows "
+            f"(got resumes={resumes}, n_reused={final_reused}, grade={grade!r})"
+        )
+    if remap_all and not pilot and slice_n is None and grade != "publishable":
+        raise RuntimeError(
+            f"--remap-all requires grade='publishable', got {grade!r} "
+            f"(resumes={resumes}, n_reused={final_reused})"
+        )
+
     elapsed_s = time.monotonic() - started_s
     shutil.copyfile(components_tsv, subrun_dir / "seqid_components.tsv")
     _write_rerun_script(output_dir)
+
+    in_git_worktree = (worktree_dir / ".git").exists()
+    branch = (
+        _git_output(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        if in_git_worktree
+        else "winner"
+    )
+    git_sha = (
+        _git_output(worktree_dir, "rev-parse", "HEAD")
+        if in_git_worktree
+        else HARDENED_FROM_GIT_SHA
+    )
 
     pins = report.get("pins") or {}
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "team": "team-a",
-        "branch": _git_output(worktree_dir, "rev-parse", "--abbrev-ref", "HEAD"),
-        "git_sha": _git_output(worktree_dir, "rev-parse", "HEAD"),
+        "branch": branch,
+        "git_sha": git_sha,
+        "hardened_from_git_sha": HARDENED_FROM_GIT_SHA,
         "created_utc": dt.datetime.now(dt.UTC).isoformat(),
         "biomapper_version": report.get("biomapper_version") or resolve_version(),
         "api_health": pins.get("api") or {},
@@ -380,6 +478,7 @@ async def run_dataset_b(
                 "output_dir": "dataset_b_proteins",
                 "wall_clock_s": round(elapsed_s, 3),
                 "status": report.get("status", "ok"),
+                "grade": grade,
                 "n_errored": 0,
                 "attempts": attempts,
                 "resumes": resumes,
