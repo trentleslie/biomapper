@@ -20,7 +20,11 @@ def _regime(name: str, total: int, fraction: float) -> dict:
         {},
         {"by_name_source_regime": None},
         {"by_name_source_regime": {}},
-        {"by_name_source_regime": {"common_systematic": {"coverage": {"total": 5, "fraction": 1.0}}}},
+        {
+            "by_name_source_regime": {
+                "common_systematic": {"coverage": {"total": 5, "fraction": 1.0}}
+            }
+        },
         {"by_name_source_regime": {"shorthand": {}}},
         {"by_name_source_regime": {"shorthand": None}},
     ],
@@ -53,7 +57,9 @@ def test_resolvability_reads_a_non_default_regime():
 def test_resolvability_never_falls_back_to_blended_coverage():
     result = {
         "coverage": {"total": 100, "fraction": 0.99},
-        "by_name_source_regime": {"common_systematic": {"coverage": {"total": 100, "fraction": 0.99}}},
+        "by_name_source_regime": {
+            "common_systematic": {"coverage": {"total": 100, "fraction": 0.99}}
+        },
     }
     assert capability_resolvability(result, regime="shorthand") is None
     with pytest.raises(ValueError, match="no 'shorthand' observations"):
